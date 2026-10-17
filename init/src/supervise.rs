@@ -197,7 +197,7 @@ fn serve(shared: &Arc<Shared>, mut stream: vsock::Stream) {
         .position(|&byte| byte == b'\n')
         .unwrap_or(line.len());
     let text = line.get(..end).unwrap_or_default();
-    let result = if line.len() > MAX_LINE && end == line.len() {
+    let result = if end > MAX_LINE {
         Err("the line is too long")
     } else {
         std::str::from_utf8(text)

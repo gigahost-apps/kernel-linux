@@ -90,7 +90,7 @@ object, at most 1 MiB (1,048,576 bytes).
 | `workdir` | no | An absolute path. Default: `/`. |
 | `stop_timeout_seconds` | no | How long a stop waits for the process after the stop signal, 0–300. Default: 10. |
 | `stop_signal` | no | The signal a stop sends the process first, as a number, 1–64: the image's `STOPSIGNAL` (for example 3 for `SIGQUIT`). Default: 15 (`SIGTERM`). |
-| `authorized_keys` | no | SSH keys for the platform's stock images: `user` (a name or uid in the image's /etc/passwd) and `keys` (one key per entry, no line breaks). |
+| `authorized_keys` | no | SSH keys for the platform's stock images: `user` (a name, or a uid; a uid absent from the image's /etc/passwd has home `/`, so the keys go to `/.ssh/authorized_keys`) and `keys` (one key per entry, no line breaks). |
 
 Unknown fields are refused, at the top level and inside `authorized_keys`.
 No string may hold a NUL byte.
@@ -148,7 +148,9 @@ messages name a field at most.
      missing;
    - `argv[0]` searched in the environment's `PATH`.
 
-   Then it reports `started`, and starts the control listener.
+   Then it reports `started`, and starts the control listener; an agent
+   that sends `stop` as soon as it has read `started` retries a refused
+   connection for a few seconds.
 9. Reaps every process. When the main process ends, or on a stop command
    (below): SIGTERM to every other process, 2 s, SIGKILL to all; then the
    one `exited` report; sync; the root remounted read-only; power-off.
