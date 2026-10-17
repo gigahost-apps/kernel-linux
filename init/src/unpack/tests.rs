@@ -634,10 +634,10 @@ fn a_wrong_digest_or_a_short_disk() {
 #[test]
 fn a_layer_cannot_read_into_the_next() {
     let scratch = Scratch::new();
-    // The first layer is an archive cut before its end marker; the
+    // The first layer is an archive cut inside its file's data; the
     // second one's bytes would complete it.
-    let whole = TarWriter::default().file("f", b"x", 0o644).end();
-    let (head, tail) = whole.split_at(1024);
+    let whole = TarWriter::default().file("f", &[b'x'; 2000], 0o644).end();
+    let (head, tail) = whole.split_at(512 + 600);
     let error = unpack_all(
         &scratch,
         &[
@@ -646,27 +646,28 @@ fn a_layer_cannot_read_into_the_next() {
         ],
     )
     .unwrap_err();
-    assert_eq!(
-        error,
-        "layer 0: the archive is invalid: the archive has no end marker"
-    );
+    assert!(error.starts_with("layer 0: "), "{error}");
+}
+
+#[test]
+fn an_archive_may_end_without_its_end_marker() {
+    // Go's archive/tar, which Docker and containerd read layers with,
+    // accepts the end of the stream between entries, or after one zero
+    // block; the digest proves the layer whole.
+    for tar in [TarWriter::default().file("f", b"x", 0o644).out.clone(), {
+        let mut tar = TarWriter::default().file("f", b"x", 0o644).end();
+        tar.truncate(1024 + 512);
+        tar
+    }] {
+        let scratch = Scratch::new();
+        unpack_all(&scratch, &[plain(tar)]).unwrap();
+        assert_eq!(fs::read(scratch.root().join("f")).unwrap(), b"x");
+    }
 }
 
 #[test]
 fn malformed_archives() {
     let cases: Vec<(Vec<u8>, &str)> = vec![
-        (
-            TarWriter::default().file("f", b"x", 0o644).out.clone(),
-            "the archive is invalid: the archive has no end marker",
-        ),
-        (
-            {
-                let mut tar = TarWriter::default().file("f", b"x", 0o644).end();
-                tar.truncate(1024 + 512);
-                tar
-            },
-            "the archive is invalid: the archive has no end marker",
-        ),
         (
             {
                 let mut tar = TarWriter::default().file("f", b"x", 0o644).end();

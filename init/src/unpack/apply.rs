@@ -19,8 +19,9 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 /// The longest path an entry may name (Linux's `PATH_MAX`).
 const MAX_PATH: usize = 4096;
 
-/// How deep a removed tree may be; deeper than any path can reach.
-const MAX_DEPTH: usize = MAX_PATH;
+/// How deep a removed or emptied tree may be: one directory descriptor is
+/// open per level, and PID 1's soft limit is 1024 descriptors.
+const MAX_DEPTH: usize = 512;
 
 /// The most paths one layer may name: its entries' and their parent
 /// directories', a path through a symbolic link counted as a path of its

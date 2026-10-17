@@ -162,8 +162,11 @@ impl<R: Read> Reader<R> {
         Ok(body)
     }
 
-    /// The next entry, or `None` at the end marker (two zero blocks).
-    /// A stream that ends without the marker is an error.
+    /// The next entry, or `None` at the archive's end: the end marker (two
+    /// zero blocks), one zero block and then the end of the stream, or the
+    /// end of the stream between entries, as Go's archive/tar (Docker's and
+    /// containerd's reader) accepts them. The layer's digest, not the
+    /// marker, proves that the layer is whole.
     pub fn next_entry(&mut self) -> Result<Option<(Entry, u64)>, Failure> {
         self.finish_entry()?;
         let mut pax: Option<Pax> = None;
@@ -171,13 +174,14 @@ impl<R: Read> Reader<R> {
         let mut long_link: Option<Vec<u8>> = None;
         loop {
             let mut block = [0u8; 512];
-            if !self.fill(&mut block)? {
-                return Err(archive("the archive has no end marker"));
-            }
-            if block.iter().all(|&byte| byte == 0) {
-                if !self.fill(&mut block)? || block.iter().any(|&byte| byte != 0) {
-                    return Err(archive("the archive has no end marker"));
+            let mut ended = !self.fill(&mut block)?;
+            if !ended && block.iter().all(|&byte| byte == 0) {
+                if self.fill(&mut block)? && block.iter().any(|&byte| byte != 0) {
+                    return Err(archive("a zero block is followed by more of the archive"));
                 }
+                ended = true;
+            }
+            if ended {
                 if pax.is_some() || long_name.is_some() || long_link.is_some() {
                     return Err(archive("an extension header describes no entry"));
                 }

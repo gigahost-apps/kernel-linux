@@ -240,9 +240,10 @@ In the unpack mode the init:
    the layers disk, hashing them with SHA-256 as it streams them,
    decompresses them as the media type says and applies the tar stream to
    the root disk (the rules below). After the layer's last byte the
-   digest must equal `digest`, and the archive must have ended with its
-   end marker (two zero blocks; at most 1 MiB, a writer's padding, may
-   follow it in the stream). Every byte of the layer is read and hashed
+   digest must equal `digest`, and the archive must end between entries:
+   with its end marker (two zero blocks; at most 1 MiB, a writer's
+   padding, may follow it in the stream), one zero block, or no marker,
+   as Go's archive/tar, the reader of Docker and containerd, accepts. Every byte of the layer is read and hashed
    even when its archive fails, and a short layers disk or a wrong digest
    is the error reported over the archive's own;
 4. `sync`, unmounts the root disk, reports `exited` with `reason`
@@ -255,8 +256,8 @@ failure, never what the archive holds:
 - `layer N: its digest does not match`
 - `layer N: the layers disk ends inside it`
 - `layer N: the gzip stream is invalid` (or `zstd`, `tar`)
-- `layer N: the archive is invalid: ...` (a bad header or PAX record, no
-  end marker, a hard link to a path that does not exist, ...)
+- `layer N: the archive is invalid: ...` (a bad header or PAX record, a
+  zero block followed by more of the archive, a hard link to a path that does not exist, ...)
 - `layer N: the archive holds ..., which is not unpacked` (a sparse file,
   an unknown entry type)
 - `layer N: the root disk is full`
@@ -306,7 +307,8 @@ through a symbolic link counts as a path of its own), a PAX header of at
 most 1 MiB, a GNU long name or link of at most 8 KiB, paths of at most
 4095 bytes, a zstd window of at most 64 MiB (every compression level but
 `--ultra` 22 and `--long` modes), and a layer's decompressed stream of at
-most twice the root disk's size and 1 GiB. File data is streamed, and a
+most twice the root disk's size and 1 GiB; a tree a whiteout removes or
+an opaque marker empties is at most 512 directories deep. File data is streamed, and a
 directory is emptied (by a whiteout or as opaque) a name at a time: a
 layer of any size unpacks in a 256 MiB guest.
 
