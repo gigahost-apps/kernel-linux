@@ -7,6 +7,12 @@ COPY seccomp-test.c /src/seccomp-test.c
 RUN gcc -static -O2 -Wall -Werror -o /seccomp-test /src/seccomp-test.c
 
 FROM docker.io/library/alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
-RUN apk add --no-cache iproute2 nftables iptables util-linux-misc
+RUN apk add --no-cache iproute2 nftables iptables util-linux-misc libcap-setcap
+# For the unpack mode's case: a file capability and a setuid bit, which
+# the unpacked disk must keep.
+RUN cp /bin/busybox /usr/local/bin/ping-cap \
+ && setcap cap_net_raw+ep /usr/local/bin/ping-cap \
+ && cp /bin/busybox /usr/local/bin/setuid-test \
+ && chmod 4755 /usr/local/bin/setuid-test
 COPY --from=seccomp /seccomp-test /usr/local/bin/seccomp-test
 COPY features.sh /usr/local/bin/features.sh

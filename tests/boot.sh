@@ -1,12 +1,15 @@
 #!/bin/bash
 # Boots a release's kernel and init under QEMU with KVM and checks what the
-# init does (docs/interface.md), one machine per case:
+# init does (docs/interface.md), one machine per case. The root disk of
+# the run cases is made as an agent makes it: the feature image's layers
+# unpacked by the init's unpack mode onto an empty ext4 disk.
 #
 #   tests/boot.sh [RELEASE_DIR]
 #
 # RELEASE_DIR holds bzImage and initramfs.cpio.zst (default:
 # out/<RELEASE>/ of this tree, as scripts/build.sh leaves it). Needs
-# podman, qemu-system-x86_64, /dev/kvm, mkfs.ext4 and debugfs. There is no
+# podman, qemu-system-x86_64, /dev/kvm, mkfs.ext4, debugfs, python3, gzip
+# and zstd. There is no
 # vsock device here, so the reports are read from the serial console (the
 # agent's fallback); the stop command is covered by the unit tests.
 set -euo pipefail
@@ -16,13 +19,14 @@ release_dir=${1:-${repo}/out/$(cat "${repo}/RELEASE")}
 kernel=${release_dir}/bzImage
 initrd=${release_dir}/initramfs.cpio.zst
 case_timeout=30
+unpack_timeout=120
 
 die() {
     echo "boot.sh: $*" >&2
     exit 1
 }
 
-for tool in podman qemu-system-x86_64 mkfs.ext4 debugfs timeout; do
+for tool in podman qemu-system-x86_64 mkfs.ext4 debugfs timeout python3 gzip zstd; do
     command -v "${tool}" > /dev/null || die "${tool} is not installed"
 done
 [[ -f ${kernel} && -f ${initrd} ]] || die "no bzImage and initramfs.cpio.zst in ${release_dir} (run scripts/build.sh)"
@@ -34,13 +38,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The feature image, tagged by its inputs, and a root disk made from it.
-# The disk's /etc/resolv.conf is a symbolic link into /run, as Debian's and
-# Ubuntu's are (it dangles once /run is a tmpfs, so a mount that followed
-# it would fail), its /etc/hosts has known contents and it has no
-# /etc/hostname, so case 4 can show the init writes through none of them.
-# root's ~/.ssh/authorized_keys is a symbolic link to /etc/shadow, so case
-# 7 can show the keys replace the link instead of writing through it.
+# The feature image, tagged by its inputs, exported as an OCI layout: its
+# layer blobs and their media types, as an agent downloads them.
 features=${repo}/tests/features
 tag=$(cat "${features}/Containerfile" "${features}/features.sh" "${features}/seccomp-test.c" | sha256sum | cut -c1-64)
 image=localhost/kernel-linux-features:${tag}
@@ -48,29 +47,103 @@ if ! podman image exists "${image}"; then
     echo "boot.sh: building ${image}"
     podman build -q -t "${image}" "${features}" > /dev/null
 fi
-container=$(podman create "${image}" /bin/true)
-podman export -o "${work}/rootfs.tar" "${container}"
-podman rm "${container}" > /dev/null
+podman save -q --format oci-dir -o "${work}/oci" "${image}"
+
+# layers_disk DISK CONFIG [--digest-of-last WRONG] FILE:MEDIA_TYPE...: writes
+# the blobs one after the other to DISK, padded to a whole sector as a
+# block device is, and the unpack config naming them to CONFIG.
+layers_disk() {
+    python3 - "$@" << 'PYTHON'
+import hashlib, json, sys
+disk, config, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
+wrong = None
+if rest[:1] == ["--wrong-last-digest"]:
+    wrong, rest = True, rest[1:]
+layers = []
+with open(disk, "wb") as out:
+    for item in rest:
+        path, media_type = item.split(":", 1)
+        digest, size = hashlib.sha256(), 0
+        with open(path, "rb") as blob:
+            while chunk := blob.read(1 << 20):
+                digest.update(chunk)
+                out.write(chunk)
+                size += len(chunk)
+        layers.append({"media_type": media_type, "digest": "sha256:" + digest.hexdigest(), "size": size})
+    out.write(b"\0" * (-out.tell() % 512))
+if wrong:
+    layers[-1]["digest"] = "sha256:" + "0" * 64
+with open(config, "w") as out:
+    json.dump({"version": 2, "mode": "unpack", "layers": layers}, out)
+PYTHON
+}
+
+# The image's layers from its manifest, as FILE:MEDIA_TYPE words.
+image_layers=$(python3 - "${work}/oci" << 'PYTHON'
+import json, sys
+oci = sys.argv[1]
+def blob(digest):
+    return f"{oci}/blobs/{digest.replace(':', '/')}"
+index = json.load(open(f"{oci}/index.json"))
+manifest = json.load(open(blob(index["manifests"][0]["digest"])))
+for layer in manifest["layers"]:
+    print(f"{blob(layer['digest'])}:{layer['mediaType']}")
+PYTHON
+)
+mapfile -t image_layers <<< "${image_layers}"
+
+# tar_layer OUT SPEC...: a layer written as an image builder writes one,
+# owned by root, from SPECs: dir:PATH:MODE, file:PATH:MODE:TEXT,
+# link:PATH:TARGET, chr:PATH:MAJOR:MINOR, fifo:PATH (a whiteout is a
+# file named .wh.NAME).
+tar_layer() {
+    python3 - "$@" << 'PYTHON'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT) as out:
+    for spec in sys.argv[2:]:
+        kind, path, *rest = spec.split(":", 3)
+        info = tarfile.TarInfo(path)
+        info.uid = info.gid = 0
+        info.mtime = 1700000000
+        data = None
+        if kind == "dir":
+            info.type, info.mode = tarfile.DIRTYPE, int(rest[0], 8)
+        elif kind == "file":
+            data = rest[1].encode()
+            info.mode, info.size = int(rest[0], 8), len(data)
+        elif kind == "link":
+            info.type, info.linkname, info.mode = tarfile.SYMTYPE, rest[0], 0o777
+        elif kind == "chr":
+            info.type, info.devmajor, info.devminor, info.mode = tarfile.CHRTYPE, int(rest[0]), int(rest[1]), 0o666
+        elif kind == "fifo":
+            info.type, info.mode = tarfile.FIFOTYPE, 0o644
+        out.addfile(info, io.BytesIO(data) if data is not None else None)
+PYTHON
+}
+
+# The run cases' fixture, a last layer over the image: the disk's
+# /etc/resolv.conf is a symbolic link into /run, as Debian's and Ubuntu's
+# are (it dangles once /run is a tmpfs, so a mount that followed it would
+# fail), its /etc/hosts has known contents and it has no /etc/hostname
+# (a whiteout), so case 4 can show the init writes through none of them.
+# root's ~/.ssh/authorized_keys is a symbolic link to /etc/shadow, so case
+# 7 can show the keys replace the link instead of writing through it.
+# zstd-compressed, as the image's own layers are gzip.
 disk_hosts='# the disk'"'"'s own hosts file'
 resolv_link=../run/systemd/resolve/stub-resolv.conf
-podman unshare sh -euc '
-    root=$1/root
-    mkdir "$root"
-    tar -C "$root" -xf "$1/rootfs.tar"
-    rm -f "$root/etc/resolv.conf" "$root/etc/hosts" "$root/etc/hostname"
-    printf "%s\n" "$2" > "$root/etc/hosts"
-    ln -s "$3" "$root/etc/resolv.conf"
-    mkdir -p -m 0700 "$root/root/.ssh"
-    ln -s /etc/shadow "$root/root/.ssh/authorized_keys"
-    mkfs.ext4 -q -F -L root -E root_owner=0:0 -d "$root" "$1/disk.img" 256M
-    rm -rf "$root"
-' sh "${work}" "${disk_hosts}" "${resolv_link}"
-rm -f "${work}/rootfs.tar"
-disk_shadow=$(debugfs -R 'cat /etc/shadow' "${work}/disk.img" 2> /dev/null)
-[[ -n ${disk_shadow} ]] || die "the disk has no /etc/shadow"
+tar_layer "${work}/fixture.tar" \
+    "file:etc/.wh.hostname:0644:" \
+    "file:etc/hosts:0644:${disk_hosts}"$'\n' \
+    "link:etc/resolv.conf:${resolv_link}" \
+    "dir:root/.ssh:0700" \
+    "link:root/.ssh/authorized_keys:/etc/shadow"
+zstd -q -19 --rm "${work}/fixture.tar" -o "${work}/fixture.tar.zst"
+fixture=${work}/fixture.tar.zst:application/vnd.oci.image.layer.v1.tar+zstd
+layers_disk "${work}/layers.img" "${work}/unpack.json" "${image_layers[@]}" "${fixture}"
 
 network='gh.ip4=10.115.0.15/24 gh.gw4=10.115.0.1 gh.ip6=fd15:115::15/64 gh.gw6=fd15:115::1 gh.dns=10.115.0.3 gh.mtu=1500 gh.vsock=1024'
 default_cmdline="console=ttyS0 quiet gh.v=1 gh.hostname=case-host ${network}"
+v2_cmdline="console=ttyS0 quiet gh.v=2 gh.hostname=case-host ${network}"
 
 failures=0
 case_dir=
@@ -80,27 +153,28 @@ fail() {
     failures=$((failures + 1))
 }
 
-# boot NAME CONFIG_JSON [CMDLINE]: boots a fresh copy of the disk with the
-# config; the serial console lands in $case_dir/serial.log, hvc0 in
-# $case_dir/hvc.log. QEMU must exit by itself (the init's power-off).
-boot() {
-    local name=$1 config=$2 cmdline=${3:-${default_cmdline}}
-    case_dir=${work}/${name}
-    mkdir "${case_dir}"
-    printf '%s' "${config}" > "${case_dir}/config.json"
-    cp --sparse=always "${work}/disk.img" "${case_dir}/disk.img"
-    echo "boot.sh: case ${name}"
-    local rc=0
-    timeout "${case_timeout}" qemu-system-x86_64 \
-        -M pc -enable-kvm -cpu host -m 256 -smp 1 -nodefaults -no-user-config \
+# qemu CMDLINE TIMEOUT DISK [LAYERS_DISK [MEMORY_MIB]]: boots the
+# machine of $case_dir with the config $case_dir/config.json; the serial
+# console lands in $case_dir/serial.log, hvc0 in $case_dir/hvc.log. QEMU
+# must exit by itself (the init's power-off) within TIMEOUT seconds.
+qemu() {
+    local cmdline=$1 timeout=$2 disk=$3 layers=${4:-} memory=${5:-256} rc=0
+    local layers_args=()
+    if [[ -n ${layers} ]]; then
+        local drive="file=${layers},format=raw,if=none,id=layers,readonly=on"
+        layers_args=(-drive "${drive}" -device "virtio-blk-pci,drive=layers")
+    fi
+    timeout "${timeout}" qemu-system-x86_64 \
+        -M pc -enable-kvm -cpu host -m "${memory}" -smp 1 -nodefaults -no-user-config \
         -display none -no-reboot \
         -kernel "${kernel}" -initrd "${initrd}" -append "${cmdline}" \
         -serial "file:${case_dir}/serial.log" \
         -device virtio-serial-pci,id=serial0 \
         -chardev "file,id=hvc,path=${case_dir}/hvc.log" \
         -device virtconsole,chardev=hvc \
-        -drive "file=${case_dir}/disk.img,format=raw,if=none,id=disk" \
+        -drive "file=${disk},format=raw,if=none,id=disk" \
         -device virtio-blk-pci,drive=disk \
+        "${layers_args[@]}" \
         -netdev user,id=net0,restrict=on,ipv4=on,net=10.115.0.0/24,host=10.115.0.1,dns=10.115.0.3,ipv6=on,ipv6-net=fd15:115::/64,ipv6-host=fd15:115::1 \
         -device virtio-net-pci,netdev=net0 \
         -object rng-random,id=rng0,filename=/dev/urandom \
@@ -109,15 +183,44 @@ boot() {
         || rc=$?
     touch "${case_dir}/serial.log" "${case_dir}/hvc.log"
     if [[ ${rc} == 124 ]]; then
-        fail "${name}: QEMU did not exit within ${case_timeout} s (no power-off)"
+        fail "${case_dir##*/}: QEMU did not exit within ${timeout} s (no power-off)"
     elif [[ ${rc} != 0 ]]; then
-        fail "${name}: QEMU exited with ${rc}"
+        fail "${case_dir##*/}: QEMU exited with ${rc}"
     fi
+}
+
+new_case() {
+    case_dir=${work}/$1
+    mkdir "${case_dir}"
+    printf '%s' "$2" > "${case_dir}/config.json"
+    echo "boot.sh: case $1"
+}
+
+# boot NAME CONFIG_JSON [CMDLINE]: boots a fresh copy of the unpacked disk
+# with the config.
+boot() {
+    new_case "$1" "$2"
+    cp --sparse=always "${work}/disk.img" "${case_dir}/disk.img"
+    qemu "${3:-${default_cmdline}}" "${case_timeout}" "${case_dir}/disk.img"
+}
+
+# unpack_boot NAME CONFIG_FILE LAYERS_DISK [DISK_MIB [MEMORY_MIB [ROOT_DISK]]]:
+# boots in the unpack mode onto a new, empty ext4 disk (or a copy of
+# ROOT_DISK), as the agent does for a new instance; the result is
+# $case_dir/disk.img.
+unpack_boot() {
+    new_case "$1" "$(cat "$2")"
+    if [[ -n ${6:-} ]]; then
+        cp --sparse=always "$6" "${case_dir}/disk.img"
+    else
+        mkfs.ext4 -q -F -L root -E root_owner=0:0 "${case_dir}/disk.img" "${4:-256}M" > /dev/null
+    fi
+    qemu "${v2_cmdline}" "${unpack_timeout}" "${case_dir}/disk.img" "$3" "${5:-256}"
 }
 
 # The one exited report on the serial console.
 exited_report() {
-    grep -a -o 'gigahost-init: report {"v":1,"event":"exited".*}' "${case_dir}/serial.log" | sed 's/^gigahost-init: report //' || true
+    grep -a -o 'gigahost-init: report {"v":[0-9]*,"event":"exited".*}' "${case_dir}/serial.log" | sed 's/^gigahost-init: report //' || true
 }
 
 expect_report() {
@@ -135,7 +238,8 @@ expect_no_report() {
 }
 
 expect_started() {
-    grep -a -q 'gigahost-init: report {"v":1,"event":"started","pid":[0-9]*,"monotonic_ms":[0-9]*}' "${case_dir}/serial.log" \
+    local v=${1:-1}
+    grep -a -q "gigahost-init: report {\"v\":${v},\"event\":\"started\",\"pid\":[0-9]*,\"monotonic_ms\":[0-9]*}" "${case_dir}/serial.log" \
         || fail "no started report"
 }
 
@@ -160,6 +264,85 @@ show_logs() {
     fi
 }
 
+# debugfs_ls DISK DIR: the names in DIR on the disk, sorted, one a line.
+debugfs_ls() {
+    debugfs -R "ls -p $2" "$1" 2> /dev/null | awk -F/ 'NF > 6 && $6 != "." && $6 != ".." { print $6 }' | sort
+}
+
+# U1. The unpack mode: the feature image's layers and the fixture onto an
+# empty disk, a version-2 report, the power-off; the file capability and
+# the setuid bit are kept. The run cases below boot copies of this disk.
+before=${failures}
+unpack_boot unpack "${work}/unpack.json" "${work}/layers.img"
+expect_report '{"v":2,"event":"exited","code":0,"signal":null,"reason":"unpacked"}'
+expect_absent serial.log '"event":"started"'
+cp --sparse=always "${case_dir}/disk.img" "${work}/disk.img"
+caps=$(debugfs -R 'ea_list /usr/local/bin/ping-cap' "${work}/disk.img" 2> /dev/null)
+[[ ${caps} == *security.capability* ]] || fail "ping-cap lost its security.capability: ${caps}"
+setuid=$(debugfs -R 'stat /usr/local/bin/setuid-test' "${work}/disk.img" 2> /dev/null)
+[[ ${setuid} == *"Mode:  04755"* && ${setuid} == *"User:     0"* ]] \
+    || fail "setuid-test is not mode 04755 owned by root: ${setuid}"
+debugfs -R 'stat /etc/hostname' "${work}/disk.img" 2>&1 | grep -q 'File not found' \
+    || fail "the fixture's whiteout left /etc/hostname"
+show_logs "${before}"
+disk_shadow=$(debugfs -R 'cat /etc/shadow' "${work}/disk.img" 2> /dev/null)
+[[ -n ${disk_shadow} ]] || die "the disk has no /etc/shadow"
+
+# U2. A whiteout and an opaque directory across two layers, as the OCI
+# rules have them; device nodes and FIFOs are made.
+before=${failures}
+tar_layer "${work}/lower.tar" \
+    "dir:wo:0755" "file:wo/a/x:0644:x" "file:wo/a/sub/y:0644:y" \
+    "file:wo/b/z:0644:z" "file:wo/gone:0644:g" "file:wo/keep:0644:k"
+tar_layer "${work}/upper.tar" \
+    "file:wo/a/early:0644:e" "file:wo/a/.wh..wh..opq:0644:" "file:wo/a/new:0644:n" \
+    "file:wo/.wh.b:0644:" "file:wo/.wh.gone:0644:" "chr:wo/null:1:3" "fifo:wo/fifo"
+gzip -n -9 "${work}/upper.tar"
+layers_disk "${work}/wo-layers.img" "${work}/wo.json" \
+    "${work}/lower.tar:application/vnd.oci.image.layer.v1.tar" \
+    "${work}/upper.tar.gz:application/vnd.docker.image.rootfs.diff.tar.gzip"
+unpack_boot whiteouts "${work}/wo.json" "${work}/wo-layers.img" 64
+expect_report '"reason":"unpacked"'
+[[ $(debugfs_ls "${case_dir}/disk.img" /wo | tr '\n' ' ') == 'a fifo keep null ' ]] \
+    || fail "/wo holds: $(debugfs_ls "${case_dir}/disk.img" /wo | tr '\n' ' ')"
+[[ $(debugfs_ls "${case_dir}/disk.img" /wo/a | tr '\n' ' ') == 'early new ' ]] \
+    || fail "/wo/a holds: $(debugfs_ls "${case_dir}/disk.img" /wo/a | tr '\n' ' ')"
+null=$(debugfs -R 'stat /wo/null' "${case_dir}/disk.img" 2> /dev/null)
+[[ ${null} == *"Type: character special"* && ${null} == *"Device major/minor number: 01:03"* ]] \
+    || fail "/wo/null is not the character device 1:3: ${null}"
+show_logs "${before}"
+
+# U3. A wrong digest: an error naming the layer, nothing started.
+before=${failures}
+layers_disk "${work}/bad-layers.img" "${work}/bad.json" --wrong-last-digest "${image_layers[@]}" "${fixture}"
+unpack_boot wrong-digest "${work}/bad.json" "${work}/bad-layers.img"
+expect_report "\"reason\":\"error\",\"message\":\"layer ${#image_layers[@]}: its digest does not match\""
+expect_absent serial.log '"event":"started"'
+show_logs "${before}"
+
+# U4. A root disk that is not empty: an error, the disk unchanged.
+before=${failures}
+unpack_boot not-empty "${work}/wo.json" "${work}/wo-layers.img" "" "" "${work}/disk.img"
+expect_report '"v":2,"event":"exited","code":null,"signal":null,"reason":"error","message":"the root disk is not empty"'
+cmp -s "${case_dir}/disk.img" "${work}/disk.img" || fail "the non-empty disk changed"
+show_logs "${before}"
+
+# U5. A layer larger than the guest's memory: 512 MiB that do not
+# compress, at 192 MiB of RAM.
+before=${failures}
+mkdir "${work}/big"
+head -c 512M /dev/urandom > "${work}/big/big"
+tar --owner=0 --group=0 --numeric-owner -C "${work}/big" -cf - big | gzip -1 > "${work}/big.tar.gz"
+layers_disk "${work}/big-layers.img" "${work}/big.json" "${work}/big.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip"
+rm -f "${work}/big.tar.gz"
+unpack_boot big-layer "${work}/big.json" "${work}/big-layers.img" 1024 192
+expect_report '"reason":"unpacked"'
+rm -f "${work}/big-layers.img"
+debugfs -R "dump /big ${case_dir}/big.out" "${case_dir}/disk.img" 2> /dev/null
+cmp -s "${case_dir}/big.out" "${work}/big/big" || fail "the unpacked 512 MiB file differs"
+rm -rf "${work}/big" "${case_dir}"
+show_logs "${before}"
+
 # 1. The kernel feature checks pass and the process exits 0.
 before=${failures}
 boot features '{"version":1,"argv":["/bin/sh","/usr/local/bin/features.sh"]}'
@@ -170,10 +353,16 @@ expect_absent hvc.log ' FAIL '
 expect_report '"code":0,"signal":null,"reason":"exited"'
 show_logs "${before}"
 
-# 2. Exit codes and signals.
+# 2. Exit codes and signals; the run mode of a version-2 boot, whose
+# reports say version 2.
 before=${failures}
 boot exit-3 '{"version":1,"argv":["/bin/sh","-c","exit 3"]}'
-expect_report '"code":3,"signal":null,"reason":"exited"'
+expect_report '{"v":1,"event":"exited","code":3,"signal":null,"reason":"exited"}'
+show_logs "${before}"
+before=${failures}
+boot exit-3-v2 '{"version":2,"mode":"run","argv":["/bin/sh","-c","exit 3"]}' "${v2_cmdline}"
+expect_started 2
+expect_report '{"v":2,"event":"exited","code":3,"signal":null,"reason":"exited"}'
 show_logs "${before}"
 before=${failures}
 boot kill-9 '{"version":1,"argv":["/bin/sh","-c","kill -9 $$"]}'
@@ -234,9 +423,15 @@ expect_absent serial.log '"event":"started"'
 expect_absent hvc.log ran
 show_logs "${before}"
 before=${failures}
-boot cmdline-v2 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "console=ttyS0 quiet gh.v=2 gh.hostname=case-host ${network}"
+boot cmdline-v3 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "console=ttyS0 quiet gh.v=3 gh.hostname=case-host ${network}"
 expect_report '"reason":"error","message":"gh.v names an interface version this init does not support"'
 expect_absent serial.log '"event":"started"'
+show_logs "${before}"
+before=${failures}
+boot config-v1-on-v2 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "${v2_cmdline}"
+expect_report '{"v":2,"event":"exited","code":null,"signal":null,"reason":"error","message":"the config'"'"'s version is not the boot'"'"'s interface version (gh.v)"}'
+expect_absent serial.log '"event":"started"'
+expect_absent hvc.log ran
 show_logs "${before}"
 
 # 6. The process's output goes to hvc0, the init's own lines to the serial

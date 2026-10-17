@@ -11,7 +11,7 @@ A release is four files and their checksums, in `out/<RELEASE>/`:
 | `SHA256SUMS` | sha256 of the four files above. |
 
 The release name, `RELEASE`, is the kernel version, `-gh` and our build
-number (`6.18.57-gh1`); a release's tag is `v<RELEASE>`.
+number (`6.18.57-gh2`); a release's tag is `v<RELEASE>`.
 
 ## Build
 
@@ -99,14 +99,19 @@ The files must be identical; then so are the release's files, which
 `tests/boot.sh [RELEASE_DIR]` boots the release under
 `qemu-system-x86_64` with KVM and checks the init's behaviour: the kernel
 feature checks (namespaces, cgroup v2, seccomp, overlayfs, FUSE,
-WireGuard, nftables and iptables-nft, IPv6, …), exit codes and signals,
+WireGuard, nftables and iptables-nft, IPv6, …) on a root disk made by the
+unpack mode from the feature image's OCI layers (and the unpack mode
+itself: file capabilities and setuid bits kept, whiteouts and opaque
+directories, a wrong digest, a non-empty disk, a 512 MiB layer in a
+192 MiB guest), exit codes and signals,
 the user, working directory and environment, the hosts, resolv.conf and
 host name (and that the disk's own files are untouched), refused configs
 and command lines, where the output goes, the SSH keys (which replace a
 symbolic link rather than write through it), the process's signal state,
 and that a kernel panic or a reboot by the process ends the machine. It
-needs `podman`, QEMU, `/dev/kvm`, `mkfs.ext4` and `debugfs`. Each case
-must end with QEMU exiting by itself within 30 s: the init's power-off,
+needs `podman`, QEMU, `/dev/kvm`, `mkfs.ext4`, `debugfs`, `python3`,
+`gzip` and `zstd`. Each case must end with QEMU exiting by itself within
+30 s (an unpack within 120 s): the init's power-off,
 or for a panic or a reboot the reset, which `-no-reboot` turns into the
 end of QEMU.
 
