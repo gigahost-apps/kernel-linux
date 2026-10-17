@@ -82,12 +82,15 @@ if ! podman image exists "$image"; then
     echo "build.sh: building $image"
     podman build -q -t "$image" -f "$repo/build/Containerfile" "$repo/build" > /dev/null
 fi
-image_id=$(podman image inspect --format '{{.Id}}' "$image")
+# The builder's inputs, not the local image's ID: package installs record
+# their time in the image, so its ID differs between machines, and
+# build-info.json (so SHA256SUMS) must not.
+base_image=$(sed -n 's/^FROM \([^ ]*@sha256:[0-9a-f]\{64\}\)$/\1/p' "$repo/build/Containerfile")
 snapshot=$(sed -n 's/^ARG DEBIAN_SNAPSHOT=//p' "$repo/build/Containerfile")
 toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$repo/rust-toolchain.toml")
 interfaces=$(sed -n 's/^pub const VERSIONS: &\[u32\] = &\[\(.*\)\];$/\1/p' "$repo/init/src/cmdline.rs")
-if [ -z "$snapshot" ] || [ -z "$toolchain" ] || [ -z "$interfaces" ]; then
-    die "cannot read the snapshot, toolchain or interface versions"
+if [ -z "$base_image" ] || [ -z "$snapshot" ] || [ -z "$toolchain" ] || [ -z "$interfaces" ]; then
+    die "cannot read the base image, snapshot, toolchain or interface versions"
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/kernel-linux-build.XXXXXX")
@@ -141,7 +144,8 @@ write_info() {
   "repo_commit": "$commit",
   "dirty": $dirty,
   "interface_versions": [$interfaces],
-  "builder_image_digest": "$image_id",
+  "builder_containerfile_sha256": "$tag",
+  "builder_base_image": "$base_image",
   "debian_snapshot": "$snapshot",
   "rust_toolchain": "$toolchain"
 }

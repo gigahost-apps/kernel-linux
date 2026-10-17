@@ -7,7 +7,7 @@ A release is four files and their checksums, in `out/<RELEASE>/`:
 | `bzImage` | The Linux kernel, version `kernel/VERSION`, built with `kernel/config`. |
 | `initramfs.cpio.zst` | A newc cpio, zstd-compressed, holding only `/init`: the static `gigahost-init` built from `init/`. |
 | `config` | The kernel configuration, identical to `kernel/config`. |
-| `build-info.json` | The release, the kernel tarball's URL and sha256, this repository's commit, whether the tree was dirty, the interface versions the init accepts (docs/interface.md), the builder image's ID, the Debian snapshot and the Rust toolchain. |
+| `build-info.json` | The release, the kernel tarball's URL and sha256, this repository's commit, whether the tree was dirty, the interface versions the init accepts (docs/interface.md), the builder's inputs (the sha256 of `build/Containerfile`, its pinned base image and Debian snapshot) and the Rust toolchain. |
 | `SHA256SUMS` | sha256 of the four files above. |
 
 The release name, `RELEASE`, is the kernel version, `-gh` and our build
@@ -69,11 +69,12 @@ Every input is pinned, so the same commit builds the same files:
   (`gigahost`, `gigahost`, `1`). Nothing reads the host's clock, user name
   or paths.
 
-`build-info.json`'s `builder_image_digest` is the ID of the builder image
-on the machine that built the release. Package installs record their own
-time inside the image, so that ID differs between machines although the
-compiler and every tool in it are the same; it is the one line of the
-release that does.
+`build-info.json` names the builder by its inputs
+(`builder_containerfile_sha256`, `builder_base_image`, `debian_snapshot`),
+not by the local image's ID: package installs record their own time
+inside the image, so that ID differs between machines although the
+compiler and every tool in it are the same. Every file of a release,
+`build-info.json` included, is therefore the same on every machine.
 
 ## Reproducibility and verification
 
@@ -81,18 +82,17 @@ release that does.
 two different paths, and fails unless both `SHA256SUMS` are identical.
 Every release tag is built that way (`.github/workflows/ci.yml`).
 
-To verify a release yourself, build its tag and compare the checksums of
-the three build outputs:
+To verify a release yourself, build its tag and compare the whole
+`SHA256SUMS`:
 
 ```sh
 git checkout v6.18.57-gh1
 scripts/build.sh --out /tmp/verify
-grep -E ' (bzImage|initramfs.cpio.zst|config)$' /tmp/verify/6.18.57-gh1/SHA256SUMS
-grep -E ' (bzImage|initramfs.cpio.zst|config)$' path/to/release/SHA256SUMS
+cmp /tmp/verify/6.18.57-gh1/SHA256SUMS path/to/release/SHA256SUMS
 ```
 
-The lines must match. (`build-info.json` matches too, but for
-`builder_image_digest`, as said above.)
+The files must be identical; then so are the release's files, which
+`sha256sum -c SHA256SUMS` in the release's directory confirms.
 
 ## Boot tests
 
@@ -102,7 +102,9 @@ feature checks (namespaces, cgroup v2, seccomp, overlayfs, FUSE,
 WireGuard, nftables and iptables-nft, IPv6, …), exit codes and signals,
 the user, working directory and environment, the hosts, resolv.conf and
 host name (and that the disk's own files are untouched), refused configs
-and command lines, and where the output goes. It needs `podman`, QEMU,
+and command lines, where the output goes, the SSH keys (which replace a
+symbolic link rather than write through it), the process's signal state,
+and that a kernel panic or a reboot by the process ends the machine. It needs `podman`, QEMU,
 `/dev/kvm`, `mkfs.ext4` and `debugfs`. Each case must end with QEMU
 exiting by itself within 30 s, which is the init's power-off.
 
