@@ -1,0 +1,12 @@
+# The feature image of tests/boot.sh: Alpine with the tools the kernel
+# feature checks use. The base is pinned by digest; the packages are
+# Alpine's current ones (they only drive the checks).
+FROM docker.io/library/alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS seccomp
+RUN apk add --no-cache gcc musl-dev linux-headers
+COPY seccomp-test.c /src/seccomp-test.c
+RUN gcc -static -O2 -Wall -Werror -o /seccomp-test /src/seccomp-test.c
+
+FROM docker.io/library/alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+RUN apk add --no-cache iproute2 nftables iptables util-linux-misc
+COPY --from=seccomp /seccomp-test /usr/local/bin/seccomp-test
+COPY features.sh /usr/local/bin/features.sh
