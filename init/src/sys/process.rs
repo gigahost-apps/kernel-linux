@@ -142,6 +142,9 @@ fn close(fd: libc::c_int) {
     unsafe { libc::close(fd) };
 }
 
+/// The highest signal number on Linux (`SIGRTMAX`, `_NSIG - 1`).
+pub const SIGNAL_MAX: libc::c_int = 64;
+
 /// The forked child: never returns.
 fn child(
     spec: &Spawn,
@@ -163,6 +166,16 @@ fn child(
     // SAFETY: plain system calls on values prepared before the fork; the
     // sigset is initialised by sigemptyset before use.
     unsafe {
+        // Every signal back to its default action, as a container runtime
+        // starts the process. An ignored signal stays ignored across
+        // execve, and Rust's runtime ignores SIGPIPE in the init: without
+        // this a pipeline's writer would get EPIPE instead of dying
+        // quietly, and a shell could not trap the signal. `signal` is
+        // async-signal-safe; SIGKILL, SIGSTOP and libc's own signals refuse
+        // the call, which changes nothing.
+        for signal in 1..=SIGNAL_MAX {
+            libc::signal(signal, libc::SIG_DFL);
+        }
         let mut empty: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut empty);
         libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, ptr::null_mut());

@@ -42,7 +42,12 @@ pub fn run() -> ! {
     }
     let pid = start(&config, &args).unwrap_or_else(|error| fail(&error));
     console::report(&Report::started(pid, sys::monotonic_ms()));
-    supervise::run(pid, args.vsock, config.stop_timeout_seconds)
+    supervise::run(
+        pid,
+        args.vsock,
+        config.stop_signal,
+        config.stop_timeout_seconds,
+    )
 }
 
 fn create_dir(path: &str, mode: u32) -> io::Result<()> {

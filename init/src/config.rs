@@ -17,6 +17,12 @@ pub const MAX_STOP_TIMEOUT_SECONDS: u32 = 300;
 
 const DEFAULT_STOP_TIMEOUT_SECONDS: u32 = 10;
 
+/// The signal a stop sends first when the config names none (SIGTERM).
+const DEFAULT_STOP_SIGNAL: i32 = 15;
+
+/// The highest signal number a config may name (`SIGRTMAX` on Linux).
+pub const MAX_SIGNAL: i32 = 64;
+
 /// The config versions this init accepts.
 pub const VERSIONS: &[u64] = &[1];
 
@@ -35,6 +41,10 @@ pub struct Config {
     pub workdir: String,
     #[serde(default = "default_stop_timeout")]
     pub stop_timeout_seconds: u32,
+    /// The image's `STOPSIGNAL`, as a number: what a stop sends the main
+    /// process first.
+    #[serde(default = "default_stop_signal")]
+    pub stop_signal: i32,
     #[serde(default)]
     pub authorized_keys: Option<AuthorizedKeys>,
 }
@@ -69,6 +79,10 @@ fn default_stop_timeout() -> u32 {
     DEFAULT_STOP_TIMEOUT_SECONDS
 }
 
+fn default_stop_signal() -> i32 {
+    DEFAULT_STOP_SIGNAL
+}
+
 const FIELDS: &[&str] = &[
     "version",
     "argv",
@@ -76,6 +90,7 @@ const FIELDS: &[&str] = &[
     "user",
     "workdir",
     "stop_timeout_seconds",
+    "stop_signal",
     "authorized_keys",
 ];
 
@@ -113,6 +128,12 @@ fn diagnose(value: &Value) -> String {
         .is_some_and(|item| u32::deserialize(item).is_err())
     {
         return "config field `stop_timeout_seconds` is not a whole number of seconds".into();
+    }
+    if object
+        .get("stop_signal")
+        .is_some_and(|item| i32::deserialize(item).is_err())
+    {
+        return "config field `stop_signal` is not a signal number".into();
     }
     if let Some(keys) = object.get("authorized_keys") {
         if let Some(inner) = keys.as_object() {
@@ -190,6 +211,11 @@ fn check(config: &Config) -> Result<(), String> {
             "config field `stop_timeout_seconds` is above {MAX_STOP_TIMEOUT_SECONDS}"
         ));
     }
+    if !(1..=MAX_SIGNAL).contains(&config.stop_signal) {
+        return Err(format!(
+            "config field `stop_signal` is not a signal number from 1 to {MAX_SIGNAL}"
+        ));
+    }
     if let Some(keys) = &config.authorized_keys {
         if keys.user.is_empty() || keys.user.contains('\0') {
             return Err("config field `authorized_keys.user` is empty".into());
@@ -225,6 +251,7 @@ mod tests {
         assert_eq!(config.user, None);
         assert_eq!(config.workdir, "/");
         assert_eq!(config.stop_timeout_seconds, 10);
+        assert_eq!(config.stop_signal, 15);
         assert!(config.authorized_keys.is_none());
     }
 
@@ -237,6 +264,7 @@ mod tests {
                  "user": "101:101",
                  "workdir": "/srv",
                  "stop_timeout_seconds": 300,
+                 "stop_signal": 3,
                  "authorized_keys": { "user": "root", "keys": ["ssh-ed25519 AAAA x"] } }"#,
         )
         .unwrap();
@@ -245,6 +273,7 @@ mod tests {
         assert_eq!(config.user.as_deref(), Some("101:101"));
         assert_eq!(config.workdir, "/srv");
         assert_eq!(config.stop_timeout_seconds, 300);
+        assert_eq!(config.stop_signal, 3);
         let keys = config.authorized_keys.unwrap();
         assert_eq!(keys.user, "root");
         assert_eq!(keys.keys, ["ssh-ed25519 AAAA x"]);
@@ -324,6 +353,33 @@ mod tests {
     }
 
     #[test]
+    fn stop_signal_range() {
+        let signal = |value: &str| {
+            parse_text(&format!(
+                r#"{{"version": 1, "argv": ["a"], "stop_signal": {value}}}"#
+            ))
+            .map(|config| config.stop_signal)
+        };
+        assert_eq!(signal("1"), Ok(1));
+        assert_eq!(signal("3"), Ok(3));
+        assert_eq!(signal("64"), Ok(64));
+        for value in ["0", "65", "-1"] {
+            assert_eq!(
+                signal(value).unwrap_err(),
+                "config field `stop_signal` is not a signal number from 1 to 64",
+                "{value}"
+            );
+        }
+        for value in [r#""SIGQUIT""#, "3.5", "null", "99999999999", "[3]"] {
+            assert_eq!(
+                signal(value).unwrap_err(),
+                "config field `stop_signal` is not a signal number",
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn other_checks() {
         for text in [
             r#"{"version": 1, "argv": ["a"], "env": ["NOEQUALS"]}"#,
@@ -348,6 +404,7 @@ mod tests {
             format!(r#"{{"version": 1, "argv": ["a"], "user": ["{SECRET}"]}}"#),
             format!(r#"{{"version": 1, "argv": ["a"], "stop_timeout_seconds": "{SECRET}"}}"#),
             format!(r#"{{"version": 1, "argv": ["a"], "workdir": "{SECRET}"}}"#),
+            format!(r#"{{"version": 1, "argv": ["a"], "stop_signal": "{SECRET}"}}"#),
             format!(r#"{{"version": 1, "argv": ["a"], "authorized_keys": "{SECRET}"}}"#),
             format!(
                 r#"{{"version": 1, "argv": ["a"], "authorized_keys": {{"user": "r", "keys": ["{SECRET}\n"]}}}}"#

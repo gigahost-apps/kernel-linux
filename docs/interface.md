@@ -24,10 +24,19 @@ kernel boot (QEMU `-kernel`, `-initrd`, `-append`, or libvirt's `<kernel>`,
   it the serial console carries the reports;
 - the config as the fw_cfg entry `opt/gigahost/config`
   (`-fw_cfg name=opt/gigahost/config,file=...`);
-- optionally virtio-rng.
+- optionally virtio-rng;
+- a reset that ends the domain: libvirt's `<on_reboot>destroy</on_reboot>`
+  and `<on_crash>destroy</on_crash>`, or QEMU's `-no-reboot`.
 
 The init powers the machine off when the container ends, so the agent sees
-the domain stop by itself.
+the domain stop by itself. The kernel resets the machine at once on a
+panic (`CONFIG_PANIC_TIMEOUT=-1`), and the process, which runs as root
+by default, can reboot or power the machine off itself; with the reset
+ending the domain, each of these ends it too, without an `exited` report.
+A halt by the process (`reboot(2)` with `RB_HALT_SYSTEM`) stops the
+CPUs without ending the domain; the agent's stop ends it then (see
+Trust). The domain's end is therefore the event the agent acts on; the
+reports (below) say why it ended when the init could say so.
 
 ## Kernel command line
 
@@ -78,7 +87,8 @@ object, at most 1 MiB (1,048,576 bytes).
 | `env` | no | `KEY=value` entries (a key is not empty). Default: none. |
 | `user` | no | Docker's `user[:group]`, by name or number. Default: root (uid 0, gid 0). |
 | `workdir` | no | An absolute path. Default: `/`. |
-| `stop_timeout_seconds` | no | How long a stop waits for the process after SIGTERM, 0–300. Default: 10. |
+| `stop_timeout_seconds` | no | How long a stop waits for the process after the stop signal, 0–300. Default: 10. |
+| `stop_signal` | no | The signal a stop sends the process first, as a number, 1–64: the image's `STOPSIGNAL` (for example 3 for `SIGQUIT`). Default: 15 (`SIGTERM`). |
 | `authorized_keys` | no | SSH keys for the platform's stock images: `user` (a name or uid in the image's /etc/passwd) and `keys` (one key per entry, no line breaks). |
 
 Unknown fields are refused, at the top level and inside `authorized_keys`.
@@ -118,6 +128,7 @@ messages name a field at most.
    `~/.ssh/authorized_keys` (directory 0700, file 0600, both owned by the
    user and the user's primary group), replacing the file.
 8. Starts the process as Docker does:
+   - every signal at its default action and none blocked;
    - stdin is `/dev/null`; stdout and stderr go to `/dev/hvc0` in raw mode
      (byte for byte, no `\r` added), or to the serial console without hvc0;
    - a new session, no controlling terminal;
@@ -176,7 +187,9 @@ serial log for lines starting with `gigahost-init: report `).
 
 - `started`: the process is running; `pid` is its PID in the guest,
   `monotonic_ms` the guest's monotonic clock at that moment.
-- `exited`, exactly once per boot, last:
+- `exited`, at most once per boot, and the last report when it comes
+  (a panic, or a reboot or power-off by the process, ends the machine
+  without one):
   - `code`: the exit status when the process exited, else `null`;
   - `signal`: the signal that killed it, else `null`;
   - `reason`: `exited` (it ended by itself), `stopped` (it ended after a
@@ -205,9 +218,10 @@ absent) and capped at 300. The init answers one line:
 {"v":1,"ok":false,"error":"unknown command"}
 ```
 
-- On `stop`: SIGTERM to the main process. When it has not ended after the
-  timeout: SIGTERM to every process, 2 s, SIGKILL to every process. The
-  end is then step 9; the `exited` report says `stopped`.
+- On `stop`: the config's `stop_signal` (SIGTERM by default) to the main
+  process. When it has not ended after the timeout: SIGTERM to every
+  process, 2 s, SIGKILL to every process. The end is then step 9; the
+  `exited` report says `stopped`.
 - A second stop, or a stop after the process ended, is answered `ok` and
   changes nothing. A stop racing the process's own exit still gives
   exactly one `exited` report.
@@ -220,3 +234,27 @@ absent) and capped at 300. The init answers one line:
 This is the graceful stop: the kernel has no input layer, so it has no
 ACPI power button. A forced stop is the hypervisor's (destroying the
 domain).
+
+## Trust
+
+The machine is the renter's: the process runs as root by default, and
+anything in the guest can speak the init's lines. The port `gh.vsock` is
+in `/proc/cmdline`, so any guest process, root or not, can connect to the
+host on it and write a report, or open many connections; a root process
+can write `gigahost-init: report ...` lines to the serial console, or
+take the control port before the init binds it. Reports are therefore
+advisory, and the agent:
+
+- bases billing and every state change on the domain's lifecycle (it
+  started, it ended), never on a report;
+- attributes a vsock connection to a machine by the peer's CID only,
+  reads at most one line of a bounded length from it, caps the
+  connections a machine may hold open, and keeps at most one `started`
+  and one `exited` report per boot;
+- from the serial log, takes the last `gigahost-init: report ` in the
+  log and the JSON object after it on that line: the init kills every
+  process before it writes its own `exited` report, so nothing in the
+  guest writes after it;
+- treats a stop as done only when the domain ends: when the init does not
+  answer, or the domain has not ended within the stop's timeout plus a
+  few seconds, it destroys the domain.

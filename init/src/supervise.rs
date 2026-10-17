@@ -24,6 +24,9 @@ struct State {
 
 struct Shared {
     main: i32,
+    /// What a stop sends the main process first (the config's
+    /// `stop_signal`).
+    stop_signal: i32,
     default_timeout_seconds: u32,
     state: Mutex<State>,
 }
@@ -37,9 +40,10 @@ impl Shared {
         self.lock().main_ended
     }
 
-    /// The stop command: SIGTERM to the main process, then, after the
-    /// timeout, SIGTERM to all, [`GRACE`], SIGKILL to all. A second stop,
-    /// or one after the process ended, changes nothing.
+    /// The stop command: the stop signal (SIGTERM unless the config names
+    /// another) to the main process, then, after the timeout, SIGTERM to
+    /// all, [`GRACE`], SIGKILL to all. A second stop, or one after the
+    /// process ended, changes nothing.
     fn request_stop(self: &Arc<Self>, timeout_seconds: Option<u32>) {
         {
             let mut state = self.lock();
@@ -47,7 +51,7 @@ impl Shared {
                 return;
             }
             state.stop_requested = true;
-            process::kill(self.main, SIGTERM);
+            process::kill(self.main, self.stop_signal);
         }
         let timeout = Duration::from_secs(u64::from(
             timeout_seconds.unwrap_or(self.default_timeout_seconds),
@@ -79,9 +83,12 @@ impl Shared {
 }
 
 /// Reaps every child until the main process ends, then ends the machine.
-pub fn run(main: i32, port: u32, default_timeout_seconds: u32) -> ! {
+/// A stop sends `stop_signal` to `main` first and waits
+/// `default_timeout_seconds` unless the command gives a timeout.
+pub fn run(main: i32, port: u32, stop_signal: i32, default_timeout_seconds: u32) -> ! {
     let shared = Arc::new(Shared {
         main,
+        stop_signal,
         default_timeout_seconds,
         state: Mutex::new(State::default()),
     });
@@ -205,4 +212,42 @@ fn serve(shared: &Arc<Shared>, mut stream: vsock::Stream) {
         Err(error) => protocol::encode_answer(Err(error)),
     };
     let _ = stream.write_all(format!("{answer}\n").as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    /// Marks the main process ended when dropped, even by a failing
+    /// assertion, so the stop's escalation thread returns instead of
+    /// signalling every process after its timeout.
+    struct Ended(Arc<Shared>);
+
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            self.0.lock().main_ended = true;
+        }
+    }
+
+    #[test]
+    fn a_stop_sends_the_stop_signal_once() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let shared = Arc::new(Shared {
+            main: i32::try_from(child.id()).unwrap(),
+            stop_signal: libc::SIGUSR1,
+            default_timeout_seconds: 300,
+            state: Mutex::new(State::default()),
+        });
+        let guard = Ended(Arc::clone(&shared));
+        shared.request_stop(None);
+        shared.request_stop(Some(300));
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGUSR1));
+        assert!(shared.lock().stop_requested);
+        drop(guard);
+    }
 }
