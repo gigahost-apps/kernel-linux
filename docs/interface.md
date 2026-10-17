@@ -77,6 +77,7 @@ object, at most 1 MiB (1,048,576 bytes).
   "user": "101:101",
   "workdir": "/",
   "stop_timeout_seconds": 10,
+  "stop_signal": 15,
   "authorized_keys": { "user": "root", "keys": ["ssh-ed25519 ..."] } }
 ```
 

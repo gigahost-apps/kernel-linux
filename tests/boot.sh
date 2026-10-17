@@ -268,9 +268,11 @@ show_logs "${before}"
 
 # 8. The process starts with every signal at its default action and none
 # blocked, as under a container runtime: a pipeline's writer dies of
-# SIGPIPE quietly.
+# SIGPIPE quietly. (grep reads its own status: busybox's sh ignores
+# SIGQUIT itself, as bash does, and gives its commands what it
+# inherited.)
 before=${failures}
-boot signals '{"version":1,"argv":["/bin/sh","-c","grep -E \"^Sig(Ign|Blk):\" /proc/$$/status; yes | head -n 1"]}'
+boot signals '{"version":1,"argv":["/bin/sh","-c","grep -E \"^Sig(Ign|Blk):\" /proc/self/status; yes | head -n 1"]}'
 expect_line hvc.log "$(printf 'SigBlk:\t0000000000000000')"
 expect_line hvc.log "$(printf 'SigIgn:\t0000000000000000')"
 expect_line hvc.log y
