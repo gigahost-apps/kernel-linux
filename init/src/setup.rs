@@ -40,11 +40,12 @@ pub fn run() -> ! {
     if let Some(keys) = &config.authorized_keys {
         write_authorized_keys(keys).unwrap_or_else(|error| fail(&error));
     }
+    let listener = supervise::bind_control(args.vsock);
     let pid = start(&config, &args).unwrap_or_else(|error| fail(&error));
     console::report(&Report::started(pid, sys::monotonic_ms()));
     supervise::run(
         pid,
-        args.vsock,
+        listener,
         config.stop_signal,
         config.stop_timeout_seconds,
     )

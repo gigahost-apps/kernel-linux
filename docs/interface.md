@@ -148,9 +148,9 @@ messages name a field at most.
      missing;
    - `argv[0]` searched in the environment's `PATH`.
 
-   Then it reports `started`, and starts the control listener; an agent
-   that sends `stop` as soon as it has read `started` retries a refused
-   connection for a few seconds.
+   The control port is bound before the process starts, so no process
+   of the image can take it; the listener answers from the moment
+   `started` is reported.
 9. Reaps every process. When the main process ends, or on a stop command
    (below): SIGTERM to every other process, 2 s, SIGKILL to all; then the
    one `exited` report; sync; the root remounted read-only; power-off.
@@ -244,8 +244,7 @@ The machine is the renter's: the process runs as root by default, and
 anything in the guest can speak the init's lines. The port `gh.vsock` is
 in `/proc/cmdline`, so any guest process, root or not, can connect to the
 host on it and write a report, or open many connections; a root process
-can write `gigahost-init: report ...` lines to the serial console, or
-take the control port before the init binds it. Reports are therefore
+can write `gigahost-init: report ...` lines to the serial console. Reports are therefore
 advisory, and the agent:
 
 - bases billing and every state change on the domain's lifecycle (it

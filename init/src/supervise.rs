@@ -85,19 +85,26 @@ impl Shared {
 /// Reaps every child until the main process ends, then ends the machine.
 /// A stop sends `stop_signal` to `main` first and waits
 /// `default_timeout_seconds` unless the command gives a timeout.
-pub fn run(main: i32, port: u32, stop_signal: i32, default_timeout_seconds: u32) -> ! {
+pub fn run(
+    main: i32,
+    listener: Option<vsock::Listener>,
+    stop_signal: i32,
+    default_timeout_seconds: u32,
+) -> ! {
     let shared = Arc::new(Shared {
         main,
         stop_signal,
         default_timeout_seconds,
         state: Mutex::new(State::default()),
     });
-    let listener_state = Arc::clone(&shared);
-    if let Err(error) = std::thread::Builder::new()
-        .name("control".into())
-        .spawn(move || control(&listener_state, port))
-    {
-        log(&format!("the control listener could not start: {error}"));
+    if let Some(listener) = listener {
+        let listener_state = Arc::clone(&shared);
+        if let Err(error) = std::thread::Builder::new()
+            .name("control".into())
+            .spawn(move || control(&listener_state, &listener))
+        {
+            log(&format!("the control listener could not start: {error}"));
+        }
     }
     loop {
         match process::peek_ended(true) {
@@ -157,17 +164,22 @@ fn finish(ended: Option<Ended>, reason: Reason) -> ! {
     console::power_off()
 }
 
-/// The control listener: one command line per connection, from the host.
-fn control(shared: &Arc<Shared>, port: u32) {
-    let listener = match vsock::Listener::bind(port) {
-        Ok(listener) => listener,
+/// Binds the control port before the process starts, so no process of
+/// the image can take it first.
+pub fn bind_control(port: u32) -> Option<vsock::Listener> {
+    match vsock::Listener::bind(port) {
+        Ok(listener) => Some(listener),
         Err(error) => {
             log(&format!(
                 "no control listener on vsock port {port}: {error}"
             ));
-            return;
+            None
         }
-    };
+    }
+}
+
+/// The control listener: one command line per connection, from the host.
+fn control(shared: &Arc<Shared>, listener: &vsock::Listener) {
     loop {
         match listener.accept() {
             Ok((stream, cid)) if cid == vsock::HOST_CID => serve(shared, stream),
