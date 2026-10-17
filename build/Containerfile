@@ -1,0 +1,52 @@
+# The release builder: every input pinned, so the same file always gives the
+# same compiler, binutils and Rust toolchain.
+#
+# - Base: Debian 13, by digest.
+# - Packages: from snapshot.debian.org at one fixed timestamp, so their
+#   versions never move. APT still checks the archive's signatures; the
+#   snapshot's Release files have expired, hence Check-Valid-Until no.
+# - Rust: rustup-init at a pinned version, checked by sha256; the toolchain
+#   comes from static.rust-lang.org, which rustup checks against the signed
+#   channel manifest.
+FROM docker.io/library/debian:13@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5
+
+ARG DEBIAN_SNAPSHOT=20261015T000000Z
+ARG RUSTUP_VERSION=1.28.2
+ARG RUSTUP_SHA256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+ARG RUST_TOOLCHAIN=1.97.0
+
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
+ && printf '%s\n' \
+    'Types: deb' \
+    "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \
+    'Suites: trixie trixie-updates' \
+    'Components: main' \
+    'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+    'Check-Valid-Until: no' \
+    '' \
+    'Types: deb' \
+    "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}" \
+    'Suites: trixie-security' \
+    'Components: main' \
+    'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+    'Check-Valid-Until: no' \
+    > /etc/apt/sources.list.d/snapshot.sources \
+ && apt-get -o Acquire::Retries=5 update \
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+    bc bison build-essential ca-certificates cpio curl flex kmod libelf-dev \
+    libssl-dev python3 rsync xz-utils zstd \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}
+
+RUN curl -fsSL --retry 5 -o /tmp/rustup-init \
+      "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+ && echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+ && chmod 0755 /tmp/rustup-init \
+ && /tmp/rustup-init -y --no-modify-path --profile minimal \
+      --default-toolchain "${RUST_TOOLCHAIN}" --target x86_64-unknown-linux-musl \
+ && rm /tmp/rustup-init \
+ && rustc --version
