@@ -93,6 +93,14 @@ impl Failure {
             Failure::Unsupported(what) => {
                 format!("the archive holds {what}, which is not unpacked")
             }
+            // The file system answers ENOSPC (or E2BIG) when an attribute
+            // does not fit in the inode or its one attribute block, on a
+            // disk that has room.
+            Failure::Apply("setting an extended attribute", error)
+                if matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::E2BIG)) =>
+            {
+                "an extended attribute does not fit".into()
+            }
             Failure::Apply(_, error)
                 if matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT)) =>
             {

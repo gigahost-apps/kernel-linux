@@ -260,6 +260,8 @@ failure, never what the archive holds:
 - `layer N: the archive holds ..., which is not unpacked` (a sparse file,
   an unknown entry type)
 - `layer N: the root disk is full`
+- `layer N: an extended attribute does not fit` (larger than the file
+  system keeps for one file)
 - `layer N: it expands to more than the root disk can hold`
 
 ### The layer rules
