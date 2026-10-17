@@ -104,9 +104,11 @@ the user, working directory and environment, the hosts, resolv.conf and
 host name (and that the disk's own files are untouched), refused configs
 and command lines, where the output goes, the SSH keys (which replace a
 symbolic link rather than write through it), the process's signal state,
-and that a kernel panic or a reboot by the process ends the machine. It needs `podman`, QEMU,
-`/dev/kvm`, `mkfs.ext4` and `debugfs`. Each case must end with QEMU
-exiting by itself within 30 s, which is the init's power-off.
+and that a kernel panic or a reboot by the process ends the machine. It
+needs `podman`, QEMU, `/dev/kvm`, `mkfs.ext4` and `debugfs`. Each case
+must end with QEMU exiting by itself within 30 s: the init's power-off,
+or for a panic or a reboot the reset, which `-no-reboot` turns into the
+end of QEMU.
 
 ## Where the kernel source comes from
 
