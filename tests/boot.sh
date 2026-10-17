@@ -35,9 +35,12 @@ cleanup() {
 trap cleanup EXIT
 
 # The feature image, tagged by its inputs, and a root disk made from it.
-# The disk's /etc/resolv.conf is a symbolic link to a file of its own, its
-# /etc/hosts has known contents and it has no /etc/hostname, so case 4 can
-# show the init writes through none of them.
+# The disk's /etc/resolv.conf is a symbolic link into /run, as Debian's and
+# Ubuntu's are (it dangles once /run is a tmpfs, so a mount that followed
+# it would fail), its /etc/hosts has known contents and it has no
+# /etc/hostname, so case 4 can show the init writes through none of them.
+# root's ~/.ssh/authorized_keys is a symbolic link to /etc/shadow, so case
+# 7 can show the keys replace the link instead of writing through it.
 features=${repo}/tests/features
 tag=$(cat "${features}/Containerfile" "${features}/features.sh" "${features}/seccomp-test.c" | sha256sum | cut -c1-64)
 image=localhost/kernel-linux-features:${tag}
@@ -49,19 +52,22 @@ container=$(podman create "${image}" /bin/true)
 podman export -o "${work}/rootfs.tar" "${container}"
 podman rm "${container}" > /dev/null
 disk_hosts='# the disk'"'"'s own hosts file'
-disk_resolv='# the disk'"'"'s own resolv.conf'
+resolv_link=../run/systemd/resolve/stub-resolv.conf
 podman unshare sh -euc '
     root=$1/root
     mkdir "$root"
     tar -C "$root" -xf "$1/rootfs.tar"
     rm -f "$root/etc/resolv.conf" "$root/etc/hosts" "$root/etc/hostname"
     printf "%s\n" "$2" > "$root/etc/hosts"
-    printf "%s\n" "$3" > "$root/etc/resolv.disk"
-    ln -s resolv.disk "$root/etc/resolv.conf"
+    ln -s "$3" "$root/etc/resolv.conf"
+    mkdir -p -m 0700 "$root/root/.ssh"
+    ln -s /etc/shadow "$root/root/.ssh/authorized_keys"
     mkfs.ext4 -q -F -L root -E root_owner=0:0 -d "$root" "$1/disk.img" 256M
     rm -rf "$root"
-' sh "${work}" "${disk_hosts}" "${disk_resolv}"
+' sh "${work}" "${disk_hosts}" "${resolv_link}"
 rm -f "${work}/rootfs.tar"
+disk_shadow=$(debugfs -R 'cat /etc/shadow' "${work}/disk.img" 2> /dev/null)
+[[ -n ${disk_shadow} ]] || die "the disk has no /etc/shadow"
 
 network='gh.ip4=10.115.0.15/24 gh.gw4=10.115.0.1 gh.ip6=fd15:115::15/64 gh.gw6=fd15:115::1 gh.dns=10.115.0.3 gh.mtu=1500 gh.vsock=1024'
 default_cmdline="console=ttyS0 quiet gh.v=1 gh.hostname=case-host ${network}"
@@ -120,6 +126,12 @@ expect_report() {
     count=$(grep -a -c '"event":"exited"' "${case_dir}/serial.log" || true)
     [[ ${count} == 1 ]] || fail "expected one exited report, found ${count}"
     [[ ${got} == *"${want}"* ]] || fail "expected a report with ${want}, got: ${got:-none}"
+}
+
+expect_no_report() {
+    if grep -a -q '"event":"exited"' "${case_dir}/serial.log"; then
+        fail "expected no exited report, got: $(exited_report)"
+    fi
 }
 
 expect_started() {
@@ -189,19 +201,20 @@ expect_report '"code":0,"signal":null,"reason":"exited"'
 show_logs "${before}"
 
 # 4. The host name, /etc/hosts and /etc/resolv.conf inside are ours, even
-# written to; the disk's own files and its symbolic link are unchanged.
+# written to; the disk's own /etc/hosts and its resolv.conf link, which
+# dangles inside (a mount that followed it would have failed), are
+# unchanged.
 before=${failures}
-boot identity '{"version":1,"argv":["/bin/sh","-c","hostname; cat /etc/hostname /etc/hosts /etc/resolv.conf; echo changed > /etc/resolv.conf; echo changed > /etc/hosts"]}'
+boot identity '{"version":1,"argv":["/bin/sh","-c","hostname; cat /etc/hostname /etc/hosts /etc/resolv.conf; echo changed > /etc/resolv.conf; echo changed > /etc/hosts; ls /run/systemd 2>&1 || echo no-run-systemd"]}'
 expect_line hvc.log case-host
 expect_line hvc.log "$(printf '10.115.0.15\tcase-host')"
 expect_line hvc.log "$(printf 'fd15:115::15\tcase-host')"
 expect_line hvc.log 'nameserver 10.115.0.3'
+expect_line hvc.log no-run-systemd
 expect_report '"code":0,"signal":null,"reason":"exited"'
 link=$(debugfs -R 'stat /etc/resolv.conf' "${case_dir}/disk.img" 2> /dev/null)
-[[ ${link} == *"Type: symlink"* && ${link} == *'Fast link dest: "resolv.disk"'* ]] \
+[[ ${link} == *"Type: symlink"* && ${link} == *"Fast link dest: \"${resolv_link}\""* ]] \
     || fail "the disk's /etc/resolv.conf is no longer its symbolic link"
-[[ $(debugfs -R 'cat /etc/resolv.disk' "${case_dir}/disk.img" 2> /dev/null) == "${disk_resolv}" ]] \
-    || fail "the disk's resolv.conf changed"
 [[ $(debugfs -R 'cat /etc/hosts' "${case_dir}/disk.img" 2> /dev/null) == "${disk_hosts}" ]] \
     || fail "the disk's /etc/hosts changed"
 show_logs "${before}"
@@ -237,6 +250,45 @@ expect_absent serial.log to-stderr
 grep -a -q '^gigahost-init: start [0-9]*' "${case_dir}/serial.log" || fail "no start line on the serial console"
 expect_absent hvc.log gigahost-init
 expect_report '"code":0,"signal":null,"reason":"exited"'
+show_logs "${before}"
+
+# 7. The SSH keys replace root's authorized_keys, a symbolic link to
+# /etc/shadow, instead of writing through it.
+before=${failures}
+boot authorized-keys '{"version":1,"argv":["/bin/true"],"authorized_keys":{"user":"root","keys":["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK5w case-key"]}}'
+expect_report '"code":0,"signal":null,"reason":"exited"'
+[[ $(debugfs -R 'cat /etc/shadow' "${case_dir}/disk.img" 2> /dev/null) == "${disk_shadow}" ]] \
+    || fail "the disk's /etc/shadow changed"
+keys=$(debugfs -R 'stat /root/.ssh/authorized_keys' "${case_dir}/disk.img" 2> /dev/null)
+[[ ${keys} == *"Type: regular"* && ${keys} == *"Mode:  0600"* ]] \
+    || fail "authorized_keys is not a regular file of mode 0600: ${keys}"
+[[ $(debugfs -R 'cat /root/.ssh/authorized_keys' "${case_dir}/disk.img" 2> /dev/null) == 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK5w case-key' ]] \
+    || fail "authorized_keys does not hold the key"
+show_logs "${before}"
+
+# 8. The process starts with every signal at its default action and none
+# blocked, as under a container runtime: a pipeline's writer dies of
+# SIGPIPE quietly.
+before=${failures}
+boot signals '{"version":1,"argv":["/bin/sh","-c","grep -E \"^Sig(Ign|Blk):\" /proc/$$/status; yes | head -n 1"]}'
+expect_line hvc.log "$(printf 'SigBlk:\t0000000000000000')"
+expect_line hvc.log "$(printf 'SigIgn:\t0000000000000000')"
+expect_line hvc.log y
+expect_absent hvc.log 'Broken pipe'
+expect_report '"code":0,"signal":null,"reason":"exited"'
+show_logs "${before}"
+
+# 9. A kernel panic and a reboot by the process end the machine at once
+# (the panic resets it, -no-reboot ends QEMU on a reset), without an exited
+# report.
+before=${failures}
+boot panic '{"version":1,"argv":["/bin/sh","-c","echo c > /proc/sysrq-trigger"]}'
+grep -a -q 'Kernel panic - not syncing' "${case_dir}/serial.log" || fail "no kernel panic on the serial console"
+expect_no_report
+show_logs "${before}"
+before=${failures}
+boot reboot '{"version":1,"argv":["/bin/sh","-c","reboot -f"]}'
+expect_no_report
 show_logs "${before}"
 
 if [[ ${failures} != 0 ]]; then
