@@ -22,9 +22,13 @@ const MAX_PATH: usize = 4096;
 /// How deep a removed tree may be; deeper than any path can reach.
 const MAX_DEPTH: usize = MAX_PATH;
 
-/// How many bytes of directory paths a layer keeps to set their times at
-/// its end; directories past it get their times at once.
+/// How many bytes a layer spends on the directories whose times it sets
+/// at its end (each path and [`DEFERRED_OVERHEAD`]); directories past it
+/// get their times at once.
 const DEFERRED_BYTES: usize = 16 << 20;
+
+/// What one deferred directory costs besides its path.
+const DEFERRED_OVERHEAD: usize = 64;
 
 const WHITEOUT: &[u8] = b".wh.";
 const OPAQUE: &[u8] = b".wh..wh..opq";
@@ -444,8 +448,9 @@ impl Tree {
         self.xattrs(entry, |name, value| {
             fs::set_xattr_fd(opened.as_fd(), name, value)
         })?;
-        if self.deferred_bytes + path.len() <= DEFERRED_BYTES {
-            self.deferred_bytes += path.len();
+        let cost = path.len() + DEFERRED_OVERHEAD;
+        if self.deferred_bytes + cost <= DEFERRED_BYTES {
+            self.deferred_bytes += cost;
             self.deferred.push((path.to_vec(), entry.mtime));
         } else {
             fs::set_times_fd(opened.as_fd(), entry.mtime.0, entry.mtime.1)

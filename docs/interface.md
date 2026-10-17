@@ -296,7 +296,8 @@ image specification's layer changesets, as container runtimes apply them):
   container runtimes skip it; the init logs how many.
 
 Its bounds, so a hostile archive ends in an `error` and never in a hang
-or in running out of memory: a PAX header of at most 1 MiB, a GNU long
+or in running out of memory: at most 1,048,576 entries in a layer, a
+PAX header of at most 1 MiB, a GNU long
 name or link of at most 8 KiB, paths of at most 4095 bytes, a zstd window
 of at most 64 MiB (every compression level but `--ultra` 22 and `--long`
 modes), and a layer's decompressed stream of at most twice the root

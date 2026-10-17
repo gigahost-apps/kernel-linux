@@ -27,6 +27,10 @@ const LAYERS: &str = "/dev/vdb";
 /// largest `--ultra` ones and `--long` uses, and bounded for a small guest.
 const MAX_ZSTD_WINDOW: u64 = 64 << 20;
 
+/// The most entries one layer may hold: what the layer's own bookkeeping
+/// (the paths it has made, for its whiteouts) may cost in a small guest.
+pub const MAX_ENTRIES: u64 = 1 << 20;
+
 /// How much may follow a tar's end marker in its stream: a writer's zero
 /// padding (GNU tar pads to 10 KiB) and a little more.
 const MAX_TRAILING: u64 = 1 << 20;
@@ -297,7 +301,14 @@ pub fn unpack_layer(
 fn apply_archive(stream: impl Read, tree: &mut Tree, limit: u64) -> Result<(), Failure> {
     let mut reader = tar::Reader::new(stream, limit);
     tree.begin_layer();
+    let mut entries: u64 = 0;
     while let Some((entry, _)) = reader.next_entry()? {
+        entries += 1;
+        if entries > MAX_ENTRIES {
+            return Err(Failure::Archive(
+                "the layer holds more than 1048576 entries",
+            ));
+        }
         tree.apply(&entry, &mut reader.data())?;
     }
     reader.finish(MAX_TRAILING)?;
