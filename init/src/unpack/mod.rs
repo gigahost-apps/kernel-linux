@@ -335,11 +335,14 @@ pub fn run(config: &Unpack) -> ! {
 fn unpack(config: &Unpack) -> Result<(), String> {
     setup::wait_for(DISK)?;
     setup::wait_for(LAYERS)?;
+    // Read-only until it is known to be empty, so a disk refused here is
+    // left as it was.
+    let flags = mount::NOSUID | mount::NODEV | mount::NOEXEC;
     mount::mount(
         Some(DISK),
         NEWROOT,
         Some("ext4"),
-        mount::NOSUID | mount::NODEV | mount::NOEXEC,
+        flags | mount::RDONLY,
         None,
     )
     .map_err(|error| format!("mounting the root disk failed: {error}"))?;
@@ -351,6 +354,8 @@ fn unpack(config: &Unpack) -> Result<(), String> {
             return Err("the root disk is not empty".into());
         }
     }
+    mount::mount(None, NEWROOT, None, flags | mount::REMOUNT, None)
+        .map_err(|error| format!("mounting the root disk failed: {error}"))?;
     let disk = std::fs::File::open(LAYERS)
         .map_err(|error| format!("opening the layers disk failed: {error}"))?;
     let root = std::fs::File::open(NEWROOT)

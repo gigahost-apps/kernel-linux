@@ -10,6 +10,8 @@ use std::ptr;
 pub const NOSUID: c_ulong = libc::MS_NOSUID;
 pub const NODEV: c_ulong = libc::MS_NODEV;
 pub const NOEXEC: c_ulong = libc::MS_NOEXEC;
+pub const RDONLY: c_ulong = libc::MS_RDONLY;
+pub const REMOUNT: c_ulong = libc::MS_REMOUNT;
 
 // From `<linux/mount.h>`; not every libc release carries them.
 const OPEN_TREE_CLONE: libc::c_uint = 1;
