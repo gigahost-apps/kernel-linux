@@ -94,3 +94,10 @@ pub fn bind_over(source: &str, target: &str) -> io::Result<()> {
 pub fn remount_root_readonly() -> io::Result<()> {
     mount(None, "/", None, libc::MS_REMOUNT | libc::MS_RDONLY, None)
 }
+
+/// Unmounts `target`.
+pub fn umount(target: &str) -> io::Result<()> {
+    let target = cstring(target)?;
+    // SAFETY: `target` is a valid C string.
+    check(unsafe { libc::umount2(target.as_ptr(), 0) }).map(drop)
+}

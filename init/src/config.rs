@@ -1,4 +1,6 @@
-//! The process's configuration, read from `fw_cfg` (interface version 1).
+//! The machine's configuration, read from `fw_cfg` (interface versions 1
+//! and 2): the process to run, or (version 2's unpack mode) the image
+//! layers to unpack onto the root disk.
 //!
 //! The config may carry secrets (environment values, keys), so no error
 //! message here quotes a value: they name the field at most.
@@ -24,7 +26,69 @@ const DEFAULT_STOP_SIGNAL: i32 = 15;
 pub const MAX_SIGNAL: i32 = 64;
 
 /// The config versions this init accepts.
-pub const VERSIONS: &[u64] = &[1];
+pub const VERSIONS: &[u64] = &[1, 2];
+
+/// The most layers an unpack config may list.
+pub const MAX_LAYERS: usize = 128;
+
+/// How a layer's blob is compressed, from its media type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compression {
+    None,
+    Gzip,
+    Zstd,
+}
+
+/// The layer media types the unpack mode takes. Non-distributable
+/// (foreign) layers are not among them: their blobs are not in the image.
+const MEDIA_TYPES: &[(&str, Compression)] = &[
+    ("application/vnd.oci.image.layer.v1.tar", Compression::None),
+    (
+        "application/vnd.oci.image.layer.v1.tar+gzip",
+        Compression::Gzip,
+    ),
+    (
+        "application/vnd.oci.image.layer.v1.tar+zstd",
+        Compression::Zstd,
+    ),
+    (
+        "application/vnd.docker.image.rootfs.diff.tar.gzip",
+        Compression::Gzip,
+    ),
+];
+
+/// What the boot does: run the image's process (versions 1 and 2), or
+/// unpack the image's layers onto the empty root disk (version 2).
+#[derive(Debug)]
+pub enum Boot {
+    Run(Config),
+    Unpack(Unpack),
+}
+
+/// The unpack mode's config: the layers, in order, as they lie one after
+/// the other on the layers disk.
+#[derive(Debug)]
+pub struct Unpack {
+    pub layers: Vec<Layer>,
+}
+
+/// One layer of the layers disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layer {
+    pub compression: Compression,
+    /// The blob's SHA-256.
+    pub digest: [u8; 32],
+    /// The blob's length in bytes, at least 1.
+    pub size: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayerFields {
+    media_type: String,
+    digest: String,
+    size: u64,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,7 +159,7 @@ const FIELDS: &[&str] = &[
 ];
 
 /// Names what in `value` keeps it from parsing, without quoting a value.
-fn diagnose(value: &Value) -> String {
+fn diagnose(value: &Value, version: u64) -> String {
     let Some(object) = value.as_object() else {
         return "the config is not a JSON object".into();
     };
@@ -149,7 +213,7 @@ fn diagnose(value: &Value) -> String {
         return "config field `authorized_keys` is not {\"user\": string, \"keys\": [string]}"
             .into();
     }
-    "the config does not match interface version 1".into()
+    format!("the config does not match interface version {version}")
 }
 
 /// A field name for a message: field names are the agent's, never secret,
@@ -161,26 +225,149 @@ fn printable(key: &str) -> String {
         .collect()
 }
 
-/// Parses and checks a config.
-pub fn parse(bytes: &[u8]) -> Result<Config, String> {
+/// Parses and checks the config of a boot of interface `boot_version`
+/// (`gh.v`), whose version the config's must be.
+pub fn parse(bytes: &[u8], boot_version: u32) -> Result<Boot, String> {
     if bytes.len() > MAX_BYTES {
         return Err("the config is larger than 1 MiB".into());
     }
-    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+    let mut value: Value = serde_json::from_slice(bytes).map_err(|error| {
         format!(
             "the config is not valid JSON (line {}, column {})",
             error.line(),
             error.column()
         )
     })?;
-    match value.get("version").map(Value::as_u64) {
+    let version = match value.get("version").map(Value::as_u64) {
         None => return Err("config field `version` is missing".into()),
-        Some(Some(version)) if VERSIONS.contains(&version) => {}
+        Some(Some(version)) if version == u64::from(boot_version) => version,
+        // A version-1 boot answers as it always has.
+        Some(Some(version)) if boot_version != 1 && VERSIONS.contains(&version) => {
+            return Err("the config's version is not the boot's interface version (gh.v)".into());
+        }
         Some(_) => return Err("the config's version is not one this init supports".into()),
+    };
+    if version == 1 {
+        return run_config(&value, version).map(Boot::Run);
     }
-    let config = Config::deserialize(&value).map_err(|_| diagnose(&value))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err("the config is not a JSON object".into());
+    };
+    match object.get("mode") {
+        None => {}
+        Some(Value::String(mode)) if mode == "run" => {}
+        Some(Value::String(mode)) if mode == "unpack" => {
+            return unpack_config(object).map(Boot::Unpack);
+        }
+        Some(_) => return Err("config field `mode` is not \"run\" or \"unpack\"".into()),
+    }
+    object.remove("mode");
+    if object.contains_key("layers") {
+        return Err("config field `layers` is taken in the unpack mode only".into());
+    }
+    run_config(&value, version).map(Boot::Run)
+}
+
+/// The run mode's config, as version 1 has it.
+fn run_config(value: &Value, version: u64) -> Result<Config, String> {
+    let config = Config::deserialize(value).map_err(|_| diagnose(value, version))?;
     check(&config)?;
     Ok(config)
+}
+
+/// The unpack mode's config: `version`, `mode` and `layers`, nothing else.
+fn unpack_config(object: &serde_json::Map<String, Value>) -> Result<Unpack, String> {
+    for key in object.keys() {
+        if key == "mode" || key == "layers" {
+            continue;
+        }
+        if !FIELDS.contains(&key.as_str()) {
+            return Err(format!(
+                "the config has an unknown field `{}`",
+                printable(key)
+            ));
+        }
+        if key != "version" {
+            return Err(format!(
+                "config field `{key}` is not taken in the unpack mode"
+            ));
+        }
+    }
+    let Some(layers) = object.get("layers") else {
+        return Err("config field `layers` is missing".into());
+    };
+    let Some(entries) = layers.as_array() else {
+        return Err("config field `layers` is not a list".into());
+    };
+    if entries.is_empty() || entries.len() > MAX_LAYERS {
+        return Err(format!(
+            "config field `layers` does not hold 1 to {MAX_LAYERS} layers"
+        ));
+    }
+    let mut total: u64 = 0;
+    let mut checked = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let layer = layer(index, entry)?;
+        total = total
+            .checked_add(layer.size)
+            .ok_or_else(|| format!("config field `layers` entry {index} ends beyond any disk"))?;
+        checked.push(layer);
+    }
+    Ok(Unpack { layers: checked })
+}
+
+fn layer(index: usize, entry: &Value) -> Result<Layer, String> {
+    let what = |problem: &str| format!("config field `layers` entry {index} {problem}");
+    let Some(object) = entry.as_object() else {
+        return Err(what("is not an object"));
+    };
+    for key in object.keys() {
+        if !["media_type", "digest", "size"].contains(&key.as_str()) {
+            return Err(what(&format!("has an unknown field `{}`", printable(key))));
+        }
+    }
+    for key in ["media_type", "digest", "size"] {
+        if !object.contains_key(key) {
+            return Err(what(&format!("lacks `{key}`")));
+        }
+    }
+    let fields = LayerFields::deserialize(entry).map_err(|_| {
+        what("is not {\"media_type\": string, \"digest\": string, \"size\": number}")
+    })?;
+    let compression = MEDIA_TYPES
+        .iter()
+        .find(|(name, _)| *name == fields.media_type)
+        .map(|&(_, compression)| compression)
+        .ok_or_else(|| what("has a media type this init does not unpack"))?;
+    let digest = parse_digest(&fields.digest)
+        .ok_or_else(|| what("has a digest that is not sha256: and 64 lowercase hex digits"))?;
+    if fields.size == 0 {
+        return Err(what("has a size of 0"));
+    }
+    Ok(Layer {
+        compression,
+        digest,
+        size: fields.size,
+    })
+}
+
+/// `sha256:` and 64 lowercase hex digits, as bytes.
+fn parse_digest(text: &str) -> Option<[u8; 32]> {
+    let hex = text.strip_prefix("sha256:")?.as_bytes();
+    if hex.len() != 64 {
+        return None;
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let mut digest = [0u8; 32];
+    for (out, pair) in digest.iter_mut().zip(hex.chunks_exact(2)) {
+        let [high, low] = pair else { return None };
+        *out = nibble(*high)? << 4 | nibble(*low)?;
+    }
+    Some(digest)
 }
 
 fn check(config: &Config) -> Result<(), String> {
@@ -239,8 +426,269 @@ mod tests {
 
     const SECRET: &str = "s3cr3t-value-never-shown";
 
+    /// A version-1 boot's run config.
     fn parse_text(text: &str) -> Result<Config, String> {
-        parse(text.as_bytes())
+        parse_boot(text, 1).map(|boot| match boot {
+            Boot::Run(config) => config,
+            Boot::Unpack(_) => panic!("a version-1 config gave the unpack mode"),
+        })
+    }
+
+    fn parse_boot(text: &str, boot_version: u32) -> Result<Boot, String> {
+        parse(text.as_bytes(), boot_version)
+    }
+
+    fn unpack(text: &str) -> Result<Vec<Layer>, String> {
+        parse_boot(text, 2).map(|boot| match boot {
+            Boot::Unpack(unpack) => unpack.layers,
+            Boot::Run(_) => panic!("not the unpack mode"),
+        })
+    }
+
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+
+    fn layer_json(media_type: &str, digest: &str, size: &str) -> String {
+        format!(r#"{{"media_type": "{media_type}", "digest": "{digest}", "size": {size}}}"#)
+    }
+
+    fn unpack_json(layers: &[String]) -> String {
+        format!(
+            r#"{{"version": 2, "mode": "unpack", "layers": [{}]}}"#,
+            layers.join(", ")
+        )
+    }
+
+    #[test]
+    fn version_two_run_mode() {
+        for text in [
+            r#"{"version": 2, "argv": ["nginx"]}"#,
+            r#"{"version": 2, "mode": "run", "argv": ["nginx"], "stop_signal": 3}"#,
+        ] {
+            match parse_boot(text, 2).unwrap() {
+                Boot::Run(config) => assert_eq!(config.argv, ["nginx"]),
+                Boot::Unpack(_) => panic!("{text}"),
+            }
+        }
+        assert_eq!(
+            parse_boot(r#"{"version": 2, "mode": "run"}"#, 2).unwrap_err(),
+            "config field `argv` is missing"
+        );
+        let with_layers = format!(
+            r#"{{"version": 2, "argv": ["a"], "layers": [{}]}}"#,
+            layer_json(TAR, DIGEST, "1")
+        );
+        assert_eq!(
+            parse_boot(&with_layers, 2).unwrap_err(),
+            "config field `layers` is taken in the unpack mode only"
+        );
+        for mode in [r#""Run""#, r#""""#, "1", "null", r#"["run"]"#] {
+            let text = format!(r#"{{"version": 2, "mode": {mode}, "argv": ["a"]}}"#);
+            assert_eq!(
+                parse_boot(&text, 2).unwrap_err(),
+                r#"config field `mode` is not "run" or "unpack""#,
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            parse_boot(r#"{"version": 2, "argv": ["a"], "x": 1}"#, 2).unwrap_err(),
+            "the config has an unknown field `x`"
+        );
+        assert_eq!(
+            parse_boot(r#"{"version": 2, "argv": 5}"#, 2).unwrap_err(),
+            "config field `argv` is not a list of strings"
+        );
+    }
+
+    #[test]
+    fn versions_must_match_the_boot() {
+        // A version-1 boot refuses version 2 as it refused any other.
+        assert_eq!(
+            parse_boot(r#"{"version": 2, "argv": ["a"]}"#, 1).unwrap_err(),
+            "the config's version is not one this init supports"
+        );
+        assert_eq!(
+            parse_boot(&unpack_json(&[layer_json(TAR, DIGEST, "1")]), 1).unwrap_err(),
+            "the config's version is not one this init supports"
+        );
+        assert_eq!(
+            parse_boot(r#"{"version": 1, "argv": ["a"]}"#, 2).unwrap_err(),
+            "the config's version is not the boot's interface version (gh.v)"
+        );
+        assert_eq!(
+            parse_boot(r#"{"version": 3, "argv": ["a"]}"#, 2).unwrap_err(),
+            "the config's version is not one this init supports"
+        );
+        // Version 1 knows no mode and no layers.
+        assert_eq!(
+            parse_boot(r#"{"version": 1, "mode": "run", "argv": ["a"]}"#, 1).unwrap_err(),
+            "the config has an unknown field `mode`"
+        );
+        assert_eq!(
+            parse_boot(r#"{"version": 1, "argv": ["a"], "layers": []}"#, 1).unwrap_err(),
+            "the config has an unknown field `layers`"
+        );
+    }
+
+    #[test]
+    fn unpack_mode() {
+        let layers = unpack(&unpack_json(&[
+            layer_json(TAR, DIGEST, "1"),
+            layer_json(
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                DIGEST,
+                "1024",
+            ),
+            layer_json(
+                "application/vnd.oci.image.layer.v1.tar+zstd",
+                DIGEST,
+                "1099511627776",
+            ),
+            layer_json(
+                "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                DIGEST,
+                "1",
+            ),
+        ]))
+        .unwrap();
+        let compressions: Vec<_> = layers.iter().map(|layer| layer.compression).collect();
+        assert_eq!(
+            compressions,
+            [
+                Compression::None,
+                Compression::Gzip,
+                Compression::Zstd,
+                Compression::Gzip
+            ]
+        );
+        assert_eq!(layers[1].size, 1024);
+        assert_eq!(layers[0].digest[0], 0x01);
+        assert_eq!(layers[0].digest[31], 0xef);
+    }
+
+    #[test]
+    fn unpack_refuses_run_fields() {
+        for field in [
+            r#""argv": ["a"]"#,
+            r#""env": []"#,
+            r#""user": "root""#,
+            r#""workdir": "/""#,
+            r#""stop_timeout_seconds": 1"#,
+            r#""stop_signal": 15"#,
+            r#""authorized_keys": {"user": "root", "keys": []}"#,
+        ] {
+            let text = format!(
+                r#"{{"version": 2, "mode": "unpack", {field}, "layers": [{}]}}"#,
+                layer_json(TAR, DIGEST, "1")
+            );
+            let error = unpack(&text).unwrap_err();
+            assert!(
+                error.ends_with("is not taken in the unpack mode"),
+                "{field}: {error}"
+            );
+        }
+        assert_eq!(
+            unpack(r#"{"version": 2, "mode": "unpack", "layers": [], "x": 1}"#).unwrap_err(),
+            "the config has an unknown field `x`"
+        );
+        assert_eq!(
+            unpack(r#"{"version": 2, "mode": "unpack"}"#).unwrap_err(),
+            "config field `layers` is missing"
+        );
+    }
+
+    #[test]
+    fn layer_count_bounds() {
+        let one = layer_json(TAR, DIGEST, "1");
+        assert_eq!(
+            unpack(&unpack_json(&[])).unwrap_err(),
+            "config field `layers` does not hold 1 to 128 layers"
+        );
+        assert_eq!(
+            unpack(&unpack_json(&vec![one.clone(); 128])).unwrap().len(),
+            128
+        );
+        assert_eq!(
+            unpack(&unpack_json(&vec![one; 129])).unwrap_err(),
+            "config field `layers` does not hold 1 to 128 layers"
+        );
+        assert_eq!(
+            unpack(r#"{"version": 2, "mode": "unpack", "layers": {}}"#).unwrap_err(),
+            "config field `layers` is not a list"
+        );
+    }
+
+    #[test]
+    fn layer_fields_checked() {
+        for digest in [
+            "sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+            "sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sha256:g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "",
+        ] {
+            assert_eq!(
+                unpack(&unpack_json(&[layer_json(TAR, digest, "1")])).unwrap_err(),
+                "config field `layers` entry 0 has a digest that is not sha256: and 64 lowercase hex digits",
+                "{digest}"
+            );
+        }
+        for media_type in [
+            "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+            "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
+            "application/vnd.oci.image.layer.v1.tar+bzip2",
+            "application/vnd.oci.image.layer.v1.tar ",
+            "",
+        ] {
+            let text = unpack_json(&[
+                layer_json(TAR, DIGEST, "1"),
+                layer_json(media_type, DIGEST, "1"),
+            ]);
+            assert_eq!(
+                unpack(&text).unwrap_err(),
+                "config field `layers` entry 1 has a media type this init does not unpack",
+                "{media_type}"
+            );
+        }
+        assert_eq!(
+            unpack(&unpack_json(&[layer_json(TAR, DIGEST, "0")])).unwrap_err(),
+            "config field `layers` entry 0 has a size of 0"
+        );
+        for size in ["-1", "1.5", r#""1""#, "null", "18446744073709551616"] {
+            let error = unpack(&unpack_json(&[layer_json(TAR, DIGEST, size)])).unwrap_err();
+            assert!(
+                error.starts_with("config field `layers` entry 0 is not"),
+                "{size}: {error}"
+            );
+        }
+        let text = unpack_json(&[
+            layer_json(TAR, DIGEST, "18446744073709551615"),
+            layer_json(TAR, DIGEST, "1"),
+        ]);
+        assert_eq!(
+            unpack(&text).unwrap_err(),
+            "config field `layers` entry 1 ends beyond any disk"
+        );
+        let text = unpack_json(&[format!(
+            r#"{{"media_type": "{TAR}", "digest": "{DIGEST}"}}"#
+        )]);
+        assert_eq!(
+            unpack(&text).unwrap_err(),
+            "config field `layers` entry 0 lacks `size`"
+        );
+        let text = unpack_json(&[format!(
+            r#"{{"media_type": "{TAR}", "digest": "{DIGEST}", "size": 1, "urls": []}}"#
+        )]);
+        assert_eq!(
+            unpack(&text).unwrap_err(),
+            "config field `layers` entry 0 has an unknown field `urls`"
+        );
+        assert_eq!(
+            unpack(&unpack_json(&["5".into()])).unwrap_err(),
+            "config field `layers` entry 0 is not an object"
+        );
     }
 
     #[test]

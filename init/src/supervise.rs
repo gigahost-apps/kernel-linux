@@ -209,19 +209,20 @@ fn serve(shared: &Arc<Shared>, mut stream: vsock::Stream) {
         .position(|&byte| byte == b'\n')
         .unwrap_or(line.len());
     let text = line.get(..end).unwrap_or_default();
+    let version = protocol::version();
     let result = if end > MAX_LINE {
         Err("the line is too long")
     } else {
         std::str::from_utf8(text)
             .map_err(|_| "the line is not a JSON object")
-            .and_then(protocol::decode_command)
+            .and_then(|line| protocol::decode_command(line, version))
     };
     let answer = match result {
         Ok(Command::Stop { timeout_seconds }) => {
             shared.request_stop(timeout_seconds);
-            protocol::encode_answer(Ok(()))
+            protocol::encode_answer(Ok(()), version)
         }
-        Err(error) => protocol::encode_answer(Err(error)),
+        Err(error) => protocol::encode_answer(Err(error), version),
     };
     let _ = stream.write_all(format!("{answer}\n").as_bytes());
 }

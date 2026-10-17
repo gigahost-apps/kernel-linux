@@ -1,14 +1,16 @@
-//! The kernel command line's `gh.*` parameters (interface version 1).
+//! The kernel command line's `gh.*` parameters (interface versions 1 and 2).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The interface versions this init accepts.
-pub const VERSIONS: &[u32] = &[1];
+pub const VERSIONS: &[u32] = &[1, 2];
 
 /// The network and identity the agent gives the instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelArgs {
+    /// The boot's interface version (`gh.v`), one of [`VERSIONS`].
+    pub version: u32,
     pub hostname: String,
     pub ip4: (Ipv4Addr, u8),
     pub gw4: Ipv4Addr,
@@ -33,6 +35,16 @@ fn words(cmdline: &str) -> Result<BTreeMap<&str, &str>, String> {
         }
     }
     Ok(found)
+}
+
+/// The interface version alone, read leniently, so a command line that
+/// fails to parse is still reported in its own version when it names one
+/// this init supports.
+pub fn version(cmdline: &str) -> Option<u32> {
+    cmdline
+        .split_ascii_whitespace()
+        .filter_map(|word| word.strip_prefix("gh.v="))
+        .find_map(|value| value.parse().ok().filter(|v| VERSIONS.contains(v)))
 }
 
 /// The vsock port alone, read leniently, so a command line that fails to
@@ -91,10 +103,11 @@ fn valid_hostname(name: &str) -> bool {
 /// other than the versions in [`VERSIONS`] is refused.
 pub fn parse(cmdline: &str) -> Result<KernelArgs, String> {
     let words = words(cmdline)?;
-    let version = required(&words, "v")?;
-    if !version.parse().is_ok_and(|v: u32| VERSIONS.contains(&v)) {
-        return Err("gh.v names an interface version this init does not support".into());
-    }
+    let version = required(&words, "v")?
+        .parse()
+        .ok()
+        .filter(|v: &u32| VERSIONS.contains(v))
+        .ok_or("gh.v names an interface version this init does not support")?;
     let hostname = required(&words, "hostname")?;
     if !valid_hostname(hostname) {
         return Err(invalid("hostname"));
@@ -130,6 +143,7 @@ pub fn parse(cmdline: &str) -> Result<KernelArgs, String> {
         .transpose()?;
     let vsock = parse_port(required(&words, "vsock")?).map_err(|()| invalid("vsock"))?;
     Ok(KernelArgs {
+        version,
         hostname: hostname.to_owned(),
         ip4,
         gw4,
@@ -151,6 +165,7 @@ mod tests {
     #[test]
     fn every_key() {
         let args = parse(FULL).unwrap();
+        assert_eq!(args.version, 1);
         assert_eq!(args.hostname, "web-1");
         assert_eq!(args.ip4, (Ipv4Addr::new(10, 0, 2, 15), 24));
         assert_eq!(args.gw4, Ipv4Addr::new(10, 0, 2, 2));
@@ -190,10 +205,24 @@ mod tests {
 
     #[test]
     fn other_versions_refused() {
-        for version in ["2", "0", "", "1.0", "one"] {
+        for version in ["3", "0", "", "1.0", "one"] {
             let line = FULL.replace("gh.v=1", &format!("gh.v={version}"));
             assert!(parse(&line).unwrap_err().contains("version"), "{version}");
         }
+    }
+
+    #[test]
+    fn version_two_accepted() {
+        let args = parse(&FULL.replace("gh.v=1", "gh.v=2")).unwrap();
+        assert_eq!(args.version, 2);
+    }
+
+    #[test]
+    fn lenient_version() {
+        assert_eq!(version("gh.v=2 gh.hostname=-bad"), Some(2));
+        assert_eq!(version("gh.v=1"), Some(1));
+        assert_eq!(version("gh.v=3"), None);
+        assert_eq!(version("quiet"), None);
     }
 
     #[test]

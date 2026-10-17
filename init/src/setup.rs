@@ -1,13 +1,15 @@
 //! Steps 1 to 8 of docs/interface.md: from the initramfs to the started
-//! process. Every failure ends in [`console::fail`].
+//! process, or in the unpack mode to the unpacked layers ([`unpack`]).
+//! Every failure ends in [`console::fail`].
 
 use crate::cmdline::{self, KernelArgs};
-use crate::config::{self, Config};
+use crate::config::{self, Boot, Config};
 use crate::console::{self, fail, log};
 use crate::etc;
-use crate::protocol::Report;
+use crate::protocol::{self, Report};
 use crate::supervise;
 use crate::sys::{self, mount, net, process};
+use crate::unpack;
 use crate::user::{self, ExecUser};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -16,8 +18,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const NEWROOT: &str = "/newroot";
-const DISK: &str = "/dev/vda";
+pub const NEWROOT: &str = "/newroot";
+pub const DISK: &str = "/dev/vda";
 const DISK_WAIT: Duration = Duration::from_secs(5);
 const OUR_FILES: &str = "/run/gigahost";
 
@@ -30,8 +32,14 @@ pub fn run() -> ! {
     if let Some(port) = cmdline::vsock_port(&cmdline) {
         console::set_port(port);
     }
+    if let Some(version) = cmdline::version(&cmdline) {
+        protocol::set_version(version);
+    }
     let args = cmdline::parse(&cmdline).unwrap_or_else(|error| fail(&error));
-    let config = read_config().unwrap_or_else(|error| fail(&error));
+    let config = match read_config(args.version).unwrap_or_else(|error| fail(&error)) {
+        Boot::Run(config) => config,
+        Boot::Unpack(layers) => unpack::run(&layers),
+    };
     switch_root().unwrap_or_else(|error| fail(&error));
     console::set_on_disk();
     system_mounts().unwrap_or_else(|error| fail(&error));
@@ -90,8 +98,8 @@ fn early() {
     }
 }
 
-/// Step 2's config, from `fw_cfg`.
-fn read_config() -> Result<Config, String> {
+/// Step 2's config, from `fw_cfg`, for a boot of interface `version`.
+fn read_config(version: u32) -> Result<Boot, String> {
     let file = fs::File::open(config::PATH).map_err(|error| {
         format!("the config (fw_cfg opt/gigahost/config) cannot be opened: {error}")
     })?;
@@ -102,19 +110,25 @@ fn read_config() -> Result<Config, String> {
     file.take(limit)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("reading the config failed: {error}"))?;
-    config::parse(&bytes)
+    config::parse(&bytes, version)
+}
+
+/// Waits up to 5 s for a disk to appear.
+pub fn wait_for(disk: &str) -> Result<(), String> {
+    let deadline = Instant::now() + DISK_WAIT;
+    while !Path::new(disk).exists() {
+        if Instant::now() >= deadline {
+            return Err(format!("no disk: {disk} did not appear within 5 s"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// Step 3: mounts the disk, moves /dev, /proc and /sys onto it, frees the
 /// initramfs and makes the disk the root.
 fn switch_root() -> Result<(), String> {
-    let deadline = Instant::now() + DISK_WAIT;
-    while !Path::new(DISK).exists() {
-        if Instant::now() >= deadline {
-            return Err(format!("no disk: {DISK} did not appear within 5 s"));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for(DISK)?;
     mount::mount(Some(DISK), NEWROOT, Some("ext4"), 0, None)
         .map_err(|error| format!("mounting the disk failed: {error}"))?;
     for directory in ["dev", "proc", "sys"] {

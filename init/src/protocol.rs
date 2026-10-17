@@ -1,12 +1,31 @@
-//! The JSON lines between the init and the host (interface version 1):
-//! the reports the init sends, the commands it accepts and its answers.
+//! The JSON lines between the init and the host (interface versions 1
+//! and 2): the reports the init sends, the commands it accepts and its
+//! answers.
 
 use crate::config::MAX_STOP_TIMEOUT_SECONDS;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// The interface version every line carries as `v`.
-pub const VERSION: u32 = 1;
+/// The interface versions whose lines this init speaks.
+pub const VERSIONS: &[u32] = &[1, 2];
+
+/// The boot's interface version (`gh.v`), which every line carries as
+/// `v`; 1 until the command line names a supported one.
+static VERSION: AtomicU32 = AtomicU32::new(1);
+
+/// Sets the version every later line carries, when it is one of
+/// [`VERSIONS`].
+pub fn set_version(version: u32) {
+    if VERSIONS.contains(&version) {
+        VERSION.store(version, Ordering::SeqCst);
+    }
+}
+
+/// The boot's interface version.
+pub fn version() -> u32 {
+    VERSION.load(Ordering::SeqCst)
+}
 
 /// Why the process ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,8 +35,11 @@ pub enum Reason {
     Exited,
     /// It ended after a stop command.
     Stopped,
-    /// The init could not start it.
+    /// The init could not start it (or, in the unpack mode, could not
+    /// unpack the layers).
     Error,
+    /// The unpack mode (version 2) unpacked every layer.
+    Unpacked,
 }
 
 /// One report, sent once per event.
@@ -47,14 +69,14 @@ pub enum Event {
 impl Report {
     pub fn started(pid: i32, monotonic_ms: u64) -> Report {
         Report {
-            v: VERSION,
+            v: version(),
             event: Event::Started { pid, monotonic_ms },
         }
     }
 
     pub fn exited(code: Option<i32>, signal: Option<i32>, reason: Reason) -> Report {
         Report {
-            v: VERSION,
+            v: version(),
             event: Event::Exited {
                 code,
                 signal,
@@ -64,9 +86,14 @@ impl Report {
         }
     }
 
+    /// The unpack mode's end: every layer is on the root disk.
+    pub fn unpacked() -> Report {
+        Report::exited(Some(0), None, Reason::Unpacked)
+    }
+
     pub fn error(message: &str) -> Report {
         Report {
-            v: VERSION,
+            v: version(),
             event: Event::Exited {
                 code: None,
                 signal: None,
@@ -79,7 +106,10 @@ impl Report {
     /// The line, without its newline.
     pub fn encode(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| {
-            String::from(r#"{"v":1,"event":"exited","code":null,"signal":null,"reason":"error","message":"report encoding failed"}"#)
+            format!(
+                r#"{{"v":{},"event":"exited","code":null,"signal":null,"reason":"error","message":"report encoding failed"}}"#,
+                self.v
+            )
         })
     }
 }
@@ -104,13 +134,14 @@ struct StopLine {
     timeout_seconds: Option<u64>,
 }
 
-/// Decodes one command line; the error is the answer's `error`.
-pub fn decode_command(line: &str) -> Result<Command, &'static str> {
+/// Decodes one command line of the boot's interface `version`; the error
+/// is the answer's `error`.
+pub fn decode_command(line: &str, version: u32) -> Result<Command, &'static str> {
     let value: Value = serde_json::from_str(line).map_err(|_| "the line is not a JSON object")?;
     if !value.is_object() {
         return Err("the line is not a JSON object");
     }
-    if value.get("v").and_then(Value::as_u64) != Some(u64::from(VERSION)) {
+    if value.get("v").and_then(Value::as_u64) != Some(u64::from(version)) {
         return Err("unsupported interface version");
     }
     match value.get("command").and_then(Value::as_str) {
@@ -134,14 +165,15 @@ pub struct Answer {
     pub error: Option<String>,
 }
 
-/// The answer line to a command, without its newline.
-pub fn encode_answer(result: Result<(), &str>) -> String {
+/// The answer line to a command, in the boot's interface `version`,
+/// without its newline.
+pub fn encode_answer(result: Result<(), &str>, version: u32) -> String {
     let answer = Answer {
-        v: VERSION,
+        v: version,
         ok: result.is_ok(),
         error: result.err().map(str::to_owned),
     };
-    serde_json::to_string(&answer).unwrap_or_else(|_| String::from(r#"{"v":1,"ok":false}"#))
+    serde_json::to_string(&answer).unwrap_or_else(|_| format!(r#"{{"v":{version},"ok":false}}"#))
 }
 
 #[cfg(test)]
@@ -188,20 +220,23 @@ mod tests {
     #[test]
     fn stop_commands() {
         assert_eq!(
-            decode_command(r#"{"v":1,"command":"stop","timeout_seconds":20}"#),
+            decode_command(r#"{"v":1,"command":"stop","timeout_seconds":20}"#, 1),
             Ok(Command::Stop {
                 timeout_seconds: Some(20)
             })
         );
         assert_eq!(
-            decode_command(r#"{"v":1,"command":"stop"}"#),
+            decode_command(r#"{"v":1,"command":"stop"}"#, 1),
             Ok(Command::Stop {
                 timeout_seconds: None
             })
         );
         // The timeout is capped.
         assert_eq!(
-            decode_command(r#"{"v":1,"command":"stop","timeout_seconds":99999999999}"#),
+            decode_command(
+                r#"{"v":1,"command":"stop","timeout_seconds":99999999999}"#,
+                1
+            ),
             Ok(Command::Stop {
                 timeout_seconds: Some(MAX_STOP_TIMEOUT_SECONDS)
             })
@@ -211,38 +246,67 @@ mod tests {
     #[test]
     fn bad_commands() {
         assert_eq!(
-            decode_command(r#"{"v":2,"command":"stop"}"#),
+            decode_command(r#"{"v":2,"command":"stop"}"#, 1),
             Err("unsupported interface version")
         );
         assert_eq!(
-            decode_command(r#"{"command":"stop"}"#),
+            decode_command(r#"{"command":"stop"}"#, 1),
             Err("unsupported interface version")
         );
         assert_eq!(
-            decode_command(r#"{"v":1,"command":"reboot"}"#),
+            decode_command(r#"{"v":1,"command":"reboot"}"#, 1),
             Err("unknown command")
         );
-        assert_eq!(decode_command(r#"{"v":1}"#), Err("unknown command"));
+        assert_eq!(decode_command(r#"{"v":1}"#, 1), Err("unknown command"));
         assert_eq!(
-            decode_command(r#"{"v":1,"command":"stop","force":true}"#),
+            decode_command(r#"{"v":1,"command":"stop","force":true}"#, 1),
             Err("invalid stop command")
         );
         assert_eq!(
-            decode_command(r#"{"v":1,"command":"stop","timeout_seconds":-1}"#),
+            decode_command(r#"{"v":1,"command":"stop","timeout_seconds":-1}"#, 1),
             Err("invalid stop command")
         );
-        assert_eq!(decode_command("stop"), Err("the line is not a JSON object"));
-        assert_eq!(decode_command("[1]"), Err("the line is not a JSON object"));
+        assert_eq!(
+            decode_command("stop", 1),
+            Err("the line is not a JSON object")
+        );
+        assert_eq!(
+            decode_command("[1]", 1),
+            Err("the line is not a JSON object")
+        );
+    }
+
+    #[test]
+    fn version_two_lines() {
+        let report = Report {
+            v: 2,
+            ..Report::unpacked()
+        };
+        assert_eq!(
+            report.encode(),
+            r#"{"v":2,"event":"exited","code":0,"signal":null,"reason":"unpacked"}"#
+        );
+        assert_eq!(
+            decode_command(r#"{"v":2,"command":"stop"}"#, 2),
+            Ok(Command::Stop {
+                timeout_seconds: None
+            })
+        );
+        assert_eq!(
+            decode_command(r#"{"v":1,"command":"stop"}"#, 2),
+            Err("unsupported interface version")
+        );
+        assert_eq!(encode_answer(Ok(()), 2), r#"{"v":2,"ok":true}"#);
     }
 
     #[test]
     fn answers() {
-        assert_eq!(encode_answer(Ok(())), r#"{"v":1,"ok":true}"#);
+        assert_eq!(encode_answer(Ok(()), 1), r#"{"v":1,"ok":true}"#);
         assert_eq!(
-            encode_answer(Err("unknown command")),
+            encode_answer(Err("unknown command"), 1),
             r#"{"v":1,"ok":false,"error":"unknown command"}"#
         );
-        let decoded: Answer = serde_json::from_str(&encode_answer(Err("x"))).unwrap();
+        let decoded: Answer = serde_json::from_str(&encode_answer(Err("x"), 1)).unwrap();
         assert_eq!(decoded.error.as_deref(), Some("x"));
     }
 }

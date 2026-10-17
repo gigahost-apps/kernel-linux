@@ -3,6 +3,7 @@
 //! nothing here decides policy; the callers do.
 #![allow(unsafe_code)]
 
+pub mod fs;
 pub mod mount;
 pub mod net;
 pub mod process;

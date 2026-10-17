@@ -16,6 +16,7 @@ mod protocol;
 mod setup;
 mod supervise;
 mod sys;
+mod unpack;
 mod user;
 
 fn main() {
@@ -32,13 +33,17 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    /// One interface version across the command line, the config and the
-    /// vsock lines; scripts/build.sh reads `cmdline::VERSIONS` for
+    /// One list of interface versions across the command line, the config
+    /// and the vsock lines; scripts/build.sh reads `cmdline::VERSIONS` for
     /// build-info.json.
     #[test]
     fn one_interface_version() {
-        assert_eq!(crate::cmdline::VERSIONS, &[1]);
-        assert_eq!(crate::config::VERSIONS, &[1]);
-        assert_eq!(crate::protocol::VERSION, 1);
+        assert_eq!(crate::cmdline::VERSIONS, &[1, 2]);
+        let config: Vec<u32> = crate::config::VERSIONS
+            .iter()
+            .map(|&v| u32::try_from(v).unwrap())
+            .collect();
+        assert_eq!(config, crate::cmdline::VERSIONS);
+        assert_eq!(crate::protocol::VERSIONS, crate::cmdline::VERSIONS);
     }
 }
