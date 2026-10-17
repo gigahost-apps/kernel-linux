@@ -5,6 +5,7 @@
 use super::apply::Tree;
 use super::unpack_layer;
 use crate::config::{Compression, Layer};
+use crate::sys::alloc::peak_during;
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs;
@@ -193,6 +194,15 @@ fn digest(blob: &[u8]) -> [u8; 32] {
 /// Writes the blobs as a layers disk next to the root and unpacks them in
 /// order; the first failure's message, if any.
 fn unpack_all(scratch: &Scratch, blobs: &[(Compression, Vec<u8>)]) -> Result<(), String> {
+    unpack_onto(scratch, &mut scratch.tree(), blobs)
+}
+
+/// As [`unpack_all`], onto a tree of the test's own.
+fn unpack_onto(
+    scratch: &Scratch,
+    tree: &mut Tree,
+    blobs: &[(Compression, Vec<u8>)],
+) -> Result<(), String> {
     let path = scratch.dir.join("layers.img");
     let mut disk = fs::File::create(&path).unwrap();
     for (_, blob) in blobs {
@@ -202,7 +212,6 @@ fn unpack_all(scratch: &Scratch, blobs: &[(Compression, Vec<u8>)]) -> Result<(),
     disk.write_all(&[0xa5; 300]).unwrap();
     drop(disk);
     let disk = fs::File::open(&path).unwrap();
-    let mut tree = scratch.tree();
     let mut offset = 0;
     for (index, (compression, blob)) in blobs.iter().enumerate() {
         let layer = Layer {
@@ -210,7 +219,7 @@ fn unpack_all(scratch: &Scratch, blobs: &[(Compression, Vec<u8>)]) -> Result<(),
             digest: digest(blob),
             size: blob.len() as u64,
         };
-        unpack_layer(&disk, offset, &layer, &mut tree, u64::MAX)
+        unpack_layer(&disk, offset, &layer, tree, u64::MAX)
             .map_err(|problem| format!("layer {index}: {problem}"))?;
         offset += layer.size;
     }
@@ -335,6 +344,9 @@ fn whiteouts_and_opaque_directories() {
         .file("b/z", b"z", 0o644)
         .file("keep/k", b"k", 0o644)
         .file("gone", b"g", 0o644)
+        .file("e/old", b"o", 0o644)
+        .file("f/old", b"o", 0o644)
+        .file("g/sub/old", b"o", 0o644)
         .end();
     let upper = TarWriter::default()
         .file("a/early", b"e", 0o644)
@@ -347,13 +359,28 @@ fn whiteouts_and_opaque_directories() {
         // The same layer's own entry stays, whiteout or not.
         .file("c/own", b"o", 0o644)
         .file("c/.wh.own", b"", 0o644)
+        // A directory of this layer's stays, but what the lower layers
+        // put in it goes: its own directory entry, merged into theirs.
+        .dir("e/", 0o750)
+        .file("e/new", b"n", 0o644)
+        .file(".wh.e", b"", 0o644)
+        // Its directory only as the parent of its entries.
+        .file("f/new", b"n", 0o644)
+        .file(".wh.f", b"", 0o644)
+        .file("g/sub/new", b"n", 0o644)
+        .file(".wh.g", b"", 0o644)
         .end();
     unpack_all(&scratch, &[plain(lower), plain(upper)]).unwrap();
     let root = scratch.root();
     assert_eq!(names(&root.join("a")), ["early", "new"]);
-    assert_eq!(names(&root), ["a", "c", "keep"]);
+    assert_eq!(names(&root), ["a", "c", "e", "f", "g", "keep"]);
     assert_eq!(names(&root.join("c")), ["own"]);
     assert_eq!(names(&root.join("keep")), ["k"]);
+    assert_eq!(names(&root.join("e")), ["new"]);
+    assert_eq!(mode(&root.join("e")), 0o750);
+    assert_eq!(names(&root.join("f")), ["new"]);
+    assert_eq!(names(&root.join("g")), ["sub"]);
+    assert_eq!(names(&root.join("g/sub")), ["new"]);
 }
 
 #[test]
@@ -367,6 +394,76 @@ fn opaque_keeps_this_layers_directories() {
     unpack_all(&scratch, &[plain(lower), plain(upper)]).unwrap();
     assert_eq!(names(&scratch.root().join("d")), ["sub"]);
     assert_eq!(names(&scratch.root().join("d/sub")), ["upper"]);
+}
+
+/// A directory a whiteout removes, or an opaque directory empties, is
+/// read a name at a time: the memory does not grow with its names.
+#[test]
+fn large_directories_are_emptied_in_bounded_memory() {
+    let long = "n".repeat(200);
+    let uppers = [
+        TarWriter::default().file(".wh.x", b"", 0o644).end(),
+        TarWriter::default()
+            .file("x/own", b"o", 0o644)
+            .file("x/.wh..wh..opq", b"", 0o644)
+            .end(),
+    ];
+    for (index, upper) in uppers.into_iter().enumerate() {
+        let scratch = Scratch::new();
+        let dir = scratch.root().join("x");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("first"), b"f").unwrap();
+        // 4,000 names of 200 bytes and more: 800 KB as a list.
+        for name in 0..4000 {
+            fs::hard_link(dir.join("first"), dir.join(format!("{long}{name}"))).unwrap();
+        }
+        let (unpacked, peak) = peak_during(|| unpack_all(&scratch, &[plain(upper)]));
+        unpacked.unwrap();
+        assert!(
+            peak < 512 << 10,
+            "upper layer {index}: {peak} bytes at once"
+        );
+        if index == 0 {
+            assert!(!dir.exists());
+        } else {
+            assert_eq!(names(&dir), ["own"]);
+        }
+    }
+}
+
+/// Paths through symbolic links name the same directories without making
+/// any, so a few entries can name many paths: past the tree's bound the
+/// layer is refused.
+#[test]
+fn the_paths_a_layer_names_are_bounded() {
+    let deep = "d/".repeat(200);
+    let mut writer = TarWriter::default();
+    writer.symlink("s", ".").symlink("t", ".");
+    writer
+        .pax(&[("path", format!("{deep}f").as_bytes())])
+        .file("f", b"f", 0o644);
+    // Ten directory entries, each merging into `d/…/d` through links of
+    // its own order: about 210 new paths each.
+    for alias in 0..10u32 {
+        let through: String = (0..10)
+            .map(|bit| if alias >> bit & 1 == 1 { "s/" } else { "t/" })
+            .collect();
+        writer
+            .pax(&[("path", format!("{through}{deep}").as_bytes())])
+            .dir("x", 0o755);
+    }
+    let tar = writer.end();
+    let tree = |scratch: &Scratch, max_paths| {
+        Tree::with_max_paths(fs::File::open(scratch.root()).unwrap().into(), max_paths)
+    };
+    let scratch = Scratch::new();
+    assert_eq!(
+        unpack_onto(&scratch, &mut tree(&scratch, 1000), &[plain(tar.clone())]).unwrap_err(),
+        "layer 0: the archive is invalid: the layer names more than 1572864 paths"
+    );
+    let scratch = Scratch::new();
+    unpack_onto(&scratch, &mut tree(&scratch, 10_000), &[plain(tar)]).unwrap();
+    assert_eq!(names(&scratch.root()), ["d", "s", "t"]);
 }
 
 #[test]

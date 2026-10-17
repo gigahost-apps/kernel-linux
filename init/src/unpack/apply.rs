@@ -14,13 +14,20 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 /// The longest path an entry may name (Linux's `PATH_MAX`).
 const MAX_PATH: usize = 4096;
 
 /// How deep a removed tree may be; deeper than any path can reach.
 const MAX_DEPTH: usize = MAX_PATH;
+
+/// The most paths one layer may name: its entries' and their parent
+/// directories', a path through a symbolic link counted as a path of its
+/// own. Half as many again as [`super::MAX_ENTRIES`], for the parents a
+/// layer leaves implicit; it bounds [`Tree::seen`] to a table of 2^21
+/// slots of 17 bytes, about 36 MB, and 54 MB while it grows into it.
+const MAX_PATHS: usize = 3 << 19;
 
 /// How many bytes a layer spends on the directories whose times it sets
 /// at its end (each path and [`DEFERRED_OVERHEAD`]); directories past it
@@ -38,8 +45,10 @@ pub struct Tree {
     root: OwnedFd,
     /// The paths this layer has made, as 128-bit hashes of their cleaned
     /// paths: what a whiteout or an opaque directory of the same layer
-    /// leaves alone. A hash keeps the memory to 16 bytes a path.
+    /// leaves alone. A hash keeps the memory to 16 bytes a path, and
+    /// [`MAX_PATHS`] the number of paths.
     seen: HashSet<[u8; 16]>,
+    max_paths: usize,
     /// Directories whose times are set at the layer's end, once their
     /// contents are in.
     deferred: Vec<(Vec<u8>, (i64, u32))>,
@@ -110,8 +119,8 @@ fn key(path: &[u8]) -> [u8; 16] {
     key
 }
 
-fn stat(dir: &OwnedFd, name: &CStr) -> Result<Option<Stat>, Failure> {
-    match fs::stat_at(dir.as_fd(), name) {
+fn stat(dir: BorrowedFd<'_>, name: &CStr) -> Result<Option<Stat>, Failure> {
+    match fs::stat_at(dir, name) {
         Ok(stat) => Ok(Some(stat)),
         Err(error) if is(&error, libc::ENOENT) => Ok(None),
         Err(error) => Err(Failure::Apply("examining a path", error)),
@@ -119,42 +128,47 @@ fn stat(dir: &OwnedFd, name: &CStr) -> Result<Option<Stat>, Failure> {
 }
 
 /// Removes `name` from `dir`, a directory with everything in it.
-fn remove(dir: &OwnedFd, name: &CStr) -> Result<(), Failure> {
+fn remove(dir: BorrowedFd<'_>, name: &CStr) -> Result<(), Failure> {
     match stat(dir, name)? {
         None => Ok(()),
         Some(found) if found.is_dir() => {
             remove_contents(dir, name, 0)?;
-            fs::unlink_at(dir.as_fd(), name, true).map_err(step("removing a directory"))
+            fs::unlink_at(dir, name, true).map_err(step("removing a directory"))
         }
-        Some(_) => fs::unlink_at(dir.as_fd(), name, false).map_err(step("removing a file")),
+        Some(_) => fs::unlink_at(dir, name, false).map_err(step("removing a file")),
     }
 }
 
-/// Empties the directory `name` in `dir`.
-fn remove_contents(dir: &OwnedFd, name: &CStr, depth: usize) -> Result<(), Failure> {
+/// Empties the directory `name` in `dir`. Each name is removed as it is
+/// read, so the memory does not grow with the directory; as POSIX leaves
+/// open whether a stream still returns every name once others are
+/// removed, passes from the start repeat until one finds nothing.
+fn remove_contents(dir: BorrowedFd<'_>, name: &CStr, depth: usize) -> Result<(), Failure> {
     if depth > MAX_DEPTH {
         return Err(Failure::Archive("a directory tree is too deep"));
     }
-    let inner = fs::open_at(
-        dir.as_fd(),
-        name,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        0,
-    )
-    .map_err(step("opening a directory"))?;
-    for child in fs::read_names(inner.as_fd()).map_err(step("reading a directory"))? {
-        match stat(&inner, &child)? {
-            None => {}
-            Some(found) if found.is_dir() => {
-                remove_contents(&inner, &child, depth + 1)?;
-                fs::unlink_at(inner.as_fd(), &child, true).map_err(step("removing a directory"))?;
+    let mut inner = fs::Dir::open_at(dir, name).map_err(step("opening a directory"))?;
+    loop {
+        let mut removed = false;
+        while let Some(child) = inner.next_name().map_err(step("reading a directory"))? {
+            match stat(inner.fd(), &child)? {
+                None => continue,
+                Some(found) if found.is_dir() => {
+                    remove_contents(inner.fd(), &child, depth + 1)?;
+                    fs::unlink_at(inner.fd(), &child, true)
+                        .map_err(step("removing a directory"))?;
+                }
+                Some(_) => {
+                    fs::unlink_at(inner.fd(), &child, false).map_err(step("removing a file"))?;
+                }
             }
-            Some(_) => {
-                fs::unlink_at(inner.as_fd(), &child, false).map_err(step("removing a file"))?;
-            }
+            removed = true;
         }
+        if !removed {
+            return Ok(());
+        }
+        inner.rewind();
     }
-    Ok(())
 }
 
 impl Tree {
@@ -163,15 +177,26 @@ impl Tree {
         Tree {
             root,
             seen: HashSet::new(),
+            max_paths: MAX_PATHS,
             deferred: Vec::new(),
             deferred_bytes: 0,
             dropped_xattrs: 0,
         }
     }
 
-    /// Starts a layer: nothing of it is seen yet.
+    /// A tree that refuses a layer naming more than `max_paths` paths.
+    #[cfg(test)]
+    pub fn with_max_paths(root: OwnedFd, max_paths: usize) -> Self {
+        Tree {
+            max_paths,
+            ..Tree::new(root)
+        }
+    }
+
+    /// Starts a layer: nothing of it is seen yet, and a larger layer's
+    /// table before it is freed.
     pub fn begin_layer(&mut self) {
-        self.seen.clear();
+        self.seen = HashSet::new();
         self.deferred.clear();
         self.deferred_bytes = 0;
     }
@@ -202,16 +227,24 @@ impl Tree {
 
     /// Marks `path` as this layer's, and its ancestors as holding this
     /// layer's entries (so an opaque directory keeps and descends into
-    /// them, and a whiteout leaves them).
-    fn mark(&mut self, path: &[u8]) {
-        if !self.seen.insert(key(path)) {
-            return;
-        }
+    /// them, and a whiteout empties rather than removes them). Past
+    /// [`MAX_PATHS`] the layer is refused: paths through symbolic links
+    /// name the same directories without making any, so the entries
+    /// alone do not bound them.
+    fn mark(&mut self, path: &[u8]) -> Result<(), Failure> {
         let mut rest = path;
-        while let Some(slash) = rest.iter().rposition(|&byte| byte == b'/') {
-            rest = rest.get(..slash).unwrap_or_default();
-            if !self.seen.insert(key(rest)) {
-                return;
+        loop {
+            let key = key(rest);
+            if self.seen.contains(&key) {
+                return Ok(());
+            }
+            if self.seen.len() >= self.max_paths {
+                return Err(Failure::Archive("the layer names more than 1572864 paths"));
+            }
+            self.seen.insert(key);
+            match rest.iter().rposition(|&byte| byte == b'/') {
+                Some(slash) => rest = rest.get(..slash).unwrap_or_default(),
+                None => return Ok(()),
             }
         }
     }
@@ -265,7 +298,7 @@ impl Tree {
                     let made = fs::open_at(current.as_fd(), &name, flags | libc::O_NOFOLLOW, 0)
                         .map_err(step("opening a directory"))?;
                     fs::chmod_fd(made.as_fd(), 0o755).map_err(step("setting a mode"))?;
-                    self.mark(&prefix);
+                    self.mark(&prefix)?;
                     made
                 }
                 Err(error) if is(&error, libc::ENOTDIR) => {
@@ -301,7 +334,7 @@ impl Tree {
         match &entry.kind {
             Kind::Directory => self.directory(&dir, &c, entry, &path)?,
             Kind::File => {
-                remove(&dir, &c)?;
+                remove(dir.as_fd(), &c)?;
                 let file = fs::open_at(
                     dir.as_fd(),
                     &c,
@@ -320,7 +353,7 @@ impl Tree {
                     .map_err(step("setting a file's times"))?;
             }
             Kind::Symlink(target) => {
-                remove(&dir, &c)?;
+                remove(dir.as_fd(), &c)?;
                 let target = CString::new(target.as_slice())
                     .map_err(|_| Failure::Archive("a link target holds a NUL byte"))?;
                 fs::symlink_at(&target, dir.as_fd(), &c)
@@ -334,20 +367,19 @@ impl Tree {
                 } else {
                     libc::S_IFBLK
                 };
-                remove(&dir, &c)?;
+                remove(dir.as_fd(), &c)?;
                 fs::mknod_at(dir.as_fd(), &c, kind | 0o600, libc::makedev(*major, *minor))
                     .map_err(step("creating a device node"))?;
                 self.node_metadata(&dir, &c, entry, true)?;
             }
             Kind::Fifo => {
-                remove(&dir, &c)?;
+                remove(dir.as_fd(), &c)?;
                 fs::mknod_at(dir.as_fd(), &c, libc::S_IFIFO | 0o600, 0)
                     .map_err(step("creating a FIFO"))?;
                 self.node_metadata(&dir, &c, entry, true)?;
             }
         }
-        self.mark(&path);
-        Ok(())
+        self.mark(&path)
     }
 
     /// `.wh.<name>` removes `<name>` as the lower layers left it;
@@ -359,8 +391,10 @@ impl Tree {
                 return Err(Failure::Archive("a path's parent is not a directory"));
             };
             let parent = parent.to_vec();
-            self.mark(&parent);
-            return self.opaque(&dir, &parent, 0);
+            self.mark(&parent)?;
+            let mut names =
+                fs::Dir::open_at(dir.as_fd(), c".").map_err(step("opening a directory"))?;
+            return self.opaque(&mut names, &parent, 0);
         }
         if target.starts_with(WHITEOUT) {
             // Other `.wh..wh.` names are aufs's own bookkeeping.
@@ -369,39 +403,47 @@ impl Tree {
         if target.is_empty() || target == b"." || target == b".." {
             return Err(Failure::Archive("a whiteout names nothing"));
         }
-        let target_path = join(parent, target);
-        if self.was_seen(&target_path) {
-            // This layer's own entry: a whiteout hides lower layers only.
+        let Some(dir) = self.open_dir(parent, false)? else {
             return Ok(());
+        };
+        let c = c_name(target)?;
+        let target_path = join(parent, target);
+        if !self.was_seen(&target_path) {
+            return remove(dir.as_fd(), &c);
         }
-        match self.open_dir(parent, false)? {
-            Some(dir) => remove(&dir, &c_name(target)?),
-            None => Ok(()),
+        // This layer's own entry stays: a whiteout hides lower layers
+        // only. A directory of this layer may hold the lower layers'
+        // entries too (it merged into theirs): those go, as from an
+        // opaque directory.
+        if stat(dir.as_fd(), &c)?.is_some_and(|found| found.is_dir()) {
+            let mut names =
+                fs::Dir::open_at(dir.as_fd(), &c).map_err(step("opening a directory"))?;
+            self.opaque(&mut names, &target_path, 0)?;
         }
+        Ok(())
     }
 
-    /// Removes from `dir` (at `path`) whatever this layer has not made,
-    /// keeping this layer's directories but emptying them of what lower
-    /// layers left in them.
-    fn opaque(&mut self, dir: &OwnedFd, path: &[u8], depth: usize) -> Result<(), Failure> {
+    /// Removes from the directory `dir` (at `path`) whatever this layer
+    /// has not made, keeping this layer's directories but emptying them of
+    /// what lower layers left in them. Each name is dealt with as it is
+    /// read, so the memory does not grow with the directory. Only names
+    /// already read are removed, which on ext4 (whose stream positions are
+    /// hashes or offsets) leaves the names still to come in the stream, as
+    /// `rm -r` relies on too.
+    fn opaque(&self, dir: &mut fs::Dir, path: &[u8], depth: usize) -> Result<(), Failure> {
         if depth > MAX_DEPTH {
             return Err(Failure::Archive("a directory tree is too deep"));
         }
-        for child in fs::read_names(dir.as_fd()).map_err(step("reading a directory"))? {
+        while let Some(child) = dir.next_name().map_err(step("reading a directory"))? {
             let child_path = join(path, child.as_bytes());
             if !self.was_seen(&child_path) {
-                remove(dir, &child)?;
+                remove(dir.fd(), &child)?;
                 continue;
             }
-            if stat(dir, &child)?.is_some_and(|found| found.is_dir()) {
-                let inner = fs::open_at(
-                    dir.as_fd(),
-                    &child,
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                    0,
-                )
-                .map_err(step("opening a directory"))?;
-                self.opaque(&inner, &child_path, depth + 1)?;
+            if stat(dir.fd(), &child)?.is_some_and(|found| found.is_dir()) {
+                let mut inner =
+                    fs::Dir::open_at(dir.fd(), &child).map_err(step("opening a directory"))?;
+                self.opaque(&mut inner, &child_path, depth + 1)?;
             }
         }
         Ok(())
@@ -416,11 +458,11 @@ impl Tree {
         entry: &Entry,
         path: &[u8],
     ) -> Result<(), Failure> {
-        match stat(dir, name)? {
+        match stat(dir.as_fd(), name)? {
             Some(found) if found.is_dir() => {}
             found => {
                 if found.is_some() {
-                    remove(dir, name)?;
+                    remove(dir.as_fd(), name)?;
                 }
                 fs::mkdir_at(dir.as_fd(), name, 0o700).map_err(step("creating a directory"))?;
             }
@@ -491,15 +533,15 @@ impl Tree {
         let (target_parent, target_name) = split(&target);
         let target_dir = self.open_dir(target_parent, false)?.ok_or_else(missing)?;
         let target_name = c_name(target_name)?;
-        let found = stat(&target_dir, &target_name)?.ok_or_else(missing)?;
+        let found = stat(target_dir.as_fd(), &target_name)?.ok_or_else(missing)?;
         if found.is_dir() {
             return Err(Failure::Archive("a hard link names a directory"));
         }
-        if let Some(existing) = stat(dir, name)? {
+        if let Some(existing) = stat(dir.as_fd(), name)? {
             if existing.dev == found.dev && existing.ino == found.ino {
                 return Ok(());
             }
-            remove(dir, name)?;
+            remove(dir.as_fd(), name)?;
         }
         fs::link_at(target_dir.as_fd(), &target_name, dir.as_fd(), name)
             .map_err(step("creating a hard link"))

@@ -3,6 +3,8 @@
 //! nothing here decides policy; the callers do.
 #![allow(unsafe_code)]
 
+#[cfg(test)]
+pub mod alloc;
 pub mod fs;
 pub mod mount;
 pub mod net;

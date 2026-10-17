@@ -276,10 +276,12 @@ image specification's layer changesets, as container runtimes apply them):
   missing parent directory is created (mode 0755, owned by root).
 - **Whiteouts**: an entry `.wh.<name>` removes `<name>` (a file, or a
   whole tree) as the lower layers left it, and is not created itself; an
-  entry of the same layer by that name stays. An entry `.wh..wh..opq` in
-  a directory empties that directory of everything the lower layers put
-  there, keeping what its own layer puts there (before or after the
-  marker). Other `.wh..wh.` names (aufs's) are ignored.
+  entry of the same layer by that name stays, a directory (its own entry
+  or the parent of its entries) emptied of what the lower layers put in
+  it, as an opaque directory is. An entry `.wh..wh..opq` in a directory
+  empties that directory of everything the lower layers put there,
+  keeping what its own layer puts there (before or after the marker).
+  Other `.wh..wh.` names (aufs's) are ignored.
 - **Replacements**: a directory over a directory merges them (the new
   entry's owner and mode, the contents of both); any other entry over an
   existing one replaces it, a directory with everything in it.
@@ -296,13 +298,15 @@ image specification's layer changesets, as container runtimes apply them):
   container runtimes skip it; the init logs how many.
 
 Its bounds, so a hostile archive ends in an `error` and never in a hang
-or in running out of memory: at most 1,048,576 entries in a layer, a
-PAX header of at most 1 MiB, a GNU long
-name or link of at most 8 KiB, paths of at most 4095 bytes, a zstd window
-of at most 64 MiB (every compression level but `--ultra` 22 and `--long`
-modes), and a layer's decompressed stream of at most twice the root
-disk's size and 1 GiB. File data is streamed: a layer of any size unpacks
-in a 256 MiB guest.
+or in running out of memory: at most 1,048,576 entries in a layer,
+naming at most 1,572,864 paths with their parent directories (a path
+through a symbolic link counts as a path of its own), a PAX header of at
+most 1 MiB, a GNU long name or link of at most 8 KiB, paths of at most
+4095 bytes, a zstd window of at most 64 MiB (every compression level but
+`--ultra` 22 and `--long` modes), and a layer's decompressed stream of at
+most twice the root disk's size and 1 GiB. File data is streamed, and a
+directory is emptied (by a whiteout or as opaque) a name at a time: a
+layer of any size unpacks in a 256 MiB guest.
 
 ## Reports
 

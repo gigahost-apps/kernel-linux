@@ -6,7 +6,8 @@
 use super::{check, errno};
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::ptr::NonNull;
 
 /// `RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`: `..` and
 /// absolute symbolic links stay inside the directory, `/proc`-style links
@@ -264,45 +265,83 @@ pub fn set_times_fd(fd: BorrowedFd<'_>, seconds: i64, nanoseconds: u32) -> io::R
     check(unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) }).map(drop)
 }
 
-/// The names in the directory `dir`, `.` and `..` left out.
-pub fn read_names(dir: BorrowedFd<'_>) -> io::Result<Vec<CString>> {
-    // A descriptor of its own, which closedir closes.
-    let own = open_at(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    let raw = std::os::fd::IntoRawFd::into_raw_fd(own);
-    // SAFETY: `raw` is an open directory descriptor we own; on success the
-    // stream owns it.
-    let stream = unsafe { libc::fdopendir(raw) };
-    if stream.is_null() {
-        let error = errno();
-        // SAFETY: fdopendir failed, so `raw` is still ours to close.
-        unsafe { libc::close(raw) };
-        return Err(error);
-    }
-    let mut names = Vec::new();
-    let result = loop {
-        // SAFETY: errno is this thread's; readdir reports an error only
-        // through it.
-        unsafe { *libc::__errno_location() = 0 };
-        // SAFETY: `stream` is an open directory stream.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
+/// A directory read one name at a time, through a descriptor of its
+/// own (with a position of its own), which the `*at` calls on its names
+/// use too.
+pub struct Dir {
+    stream: NonNull<libc::DIR>,
+    /// The stream's descriptor, which it owns.
+    fd: RawFd,
+}
+
+impl Dir {
+    /// Opens the directory `name` in `dir` for reading, never following a
+    /// symbolic link; `.` opens `dir` itself anew.
+    pub fn open_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<Dir> {
+        let own = open_at(
+            dir,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )?;
+        let fd = own.into_raw_fd();
+        // SAFETY: `fd` is an open directory descriptor we own; on success
+        // the stream owns it.
+        let stream = unsafe { libc::fdopendir(fd) };
+        let Some(stream) = NonNull::new(stream) else {
             let error = errno();
-            break if error.raw_os_error() == Some(0) {
-                Ok(())
-            } else {
-                Err(error)
-            };
+            // SAFETY: fdopendir failed, so `fd` is still ours to close.
+            unsafe { libc::close(fd) };
+            return Err(error);
+        };
+        Ok(Dir { stream, fd })
+    }
+
+    /// The directory's descriptor, for `*at` calls on its names.
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the stream owns `fd` and keeps it open until `self` is
+        // dropped, and the borrow cannot outlive `self`.
+        unsafe { BorrowedFd::borrow_raw(self.fd) }
+    }
+
+    /// The next name, `.` and `..` left out; `None` at the end.
+    pub fn next_name(&mut self) -> io::Result<Option<CString>> {
+        loop {
+            // SAFETY: errno is this thread's; readdir reports an error only
+            // through it.
+            unsafe { *libc::__errno_location() = 0 };
+            // SAFETY: `stream` is an open directory stream.
+            let entry = unsafe { libc::readdir(self.stream.as_ptr()) };
+            if entry.is_null() {
+                let error = errno();
+                return if error.raw_os_error() == Some(0) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+            // SAFETY: readdir returned a valid entry whose d_name is a
+            // NUL-terminated string, alive until the next readdir.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name != c"." && name != c".." {
+                return Ok(Some(name.to_owned()));
+            }
         }
-        // SAFETY: readdir returned a valid entry whose d_name is a
-        // NUL-terminated string, alive until the next readdir.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name != c"." && name != c".." {
-            names.push(name.to_owned());
-        }
-    };
-    // SAFETY: `stream` is open and not used after this.
-    unsafe { libc::closedir(stream) };
-    result.map(|()| names)
+    }
+
+    /// Back to the directory's first name.
+    pub fn rewind(&mut self) {
+        // SAFETY: `stream` is an open directory stream.
+        unsafe { libc::rewinddir(self.stream.as_ptr()) };
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        // SAFETY: `stream` is open and not used after this; closing it
+        // closes `fd`.
+        unsafe { libc::closedir(self.stream.as_ptr()) };
+    }
 }
 
 /// `lgetxattr(path, name)`, for the tests.
