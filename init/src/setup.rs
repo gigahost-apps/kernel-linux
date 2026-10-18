@@ -23,6 +23,13 @@ pub const DISK: &str = "/dev/vda";
 const DISK_WAIT: Duration = Duration::from_secs(5);
 const OUR_FILES: &str = "/run/gigahost";
 
+/// The cgroup an init system's cgroup namespace starts at (version 3).
+const PAYLOAD_CGROUP: &str = "/sys/fs/cgroup/payload";
+
+/// What the image's init system reads to know it runs in a container,
+/// before the config's environment, which may set either.
+const INIT_SYSTEM_ENV: &[&str] = &["container=gigahost", "container_ttys="];
+
 /// Runs the whole init; never returns.
 pub fn run() -> ! {
     early();
@@ -56,6 +63,7 @@ pub fn run() -> ! {
         listener,
         config.stop_signal,
         config.stop_timeout_seconds,
+        config.init_system,
     )
 }
 
@@ -386,7 +394,27 @@ fn write_authorized_keys(keys: &config::AuthorizedKeys) -> Result<(), String> {
     Ok(())
 }
 
-/// Step 8: the process, as Docker starts it. Returns its PID.
+/// Version 3's `init_system`: the payload cgroup, with every controller
+/// the kernel offers enabled for it. The init stays in the root cgroup,
+/// which cgroup v2's no-internal-process rule exempts.
+fn payload_cgroup() -> Result<(), String> {
+    create_dir(PAYLOAD_CGROUP, 0o755)
+        .map_err(|error| format!("creating the payload cgroup failed: {error}"))?;
+    let controllers = fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")
+        .map_err(|error| format!("reading the cgroup controllers failed: {error}"))?;
+    for controller in controllers.split_ascii_whitespace() {
+        fs::write(
+            "/sys/fs/cgroup/cgroup.subtree_control",
+            format!("+{controller}"),
+        )
+        .map_err(|error| format!("enabling the cgroup controller {controller} failed: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Step 8: the process, as Docker starts it, or (version 3's
+/// `init_system`) the image's init in namespaces of its own. Returns its
+/// PID.
 fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
     let (passwd, groups) = read_accounts();
     let ExecUser {
@@ -396,7 +424,19 @@ fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
         home,
     } = user::resolve(config.user.as_deref().unwrap_or(""), &passwd, &groups)
         .map_err(|error| error.message().to_owned())?;
-    let env = etc::process_env(&config.env, &args.hostname, &home);
+    let env = if config.init_system {
+        if uid != 0 || gid != 0 {
+            return Err("config field `user` is not root, which `init_system` requires".into());
+        }
+        let mut env: Vec<String> = INIT_SYSTEM_ENV
+            .iter()
+            .map(|&entry| entry.to_owned())
+            .collect();
+        env.extend(config.env.iter().cloned());
+        etc::process_env(&env, &args.hostname, &home)
+    } else {
+        etc::process_env(&config.env, &args.hostname, &home)
+    };
     if fs::metadata(&config.workdir).is_err() {
         fs::DirBuilder::new()
             .recursive(true)
@@ -405,8 +445,13 @@ fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
             .map_err(|error| format!("creating the working directory failed: {error}"))?;
     }
     let first = config.argv.first().map_or("", String::as_str);
-    let program = etc::look_path(first, etc::path_of(&env), Path::new(&config.workdir))
-        .ok_or("the command was not found in PATH")?;
+    let program = etc::look_path(first, etc::path_of(&env), Path::new(&config.workdir)).ok_or(
+        if config.init_system {
+            "the image's init (`argv`) was not found or is not executable"
+        } else {
+            "the command was not found in PATH"
+        },
+    )?;
     let output = if Path::new("/dev/hvc0").exists() {
         match sys::open_raw_tty("/dev/hvc0") {
             // Held open for the machine's life, which keeps it raw.
@@ -417,7 +462,7 @@ fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
     } else {
         "/dev/console"
     };
-    let spawn = process::Spawn::new(
+    let mut spawn = process::Spawn::new(
         &program,
         &config.argv,
         &env,
@@ -426,6 +471,15 @@ fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
         (uid, gid, &groups),
     )
     .map_err(|_| "the command, environment or working directory holds a NUL byte".to_owned())?;
+    if config.init_system {
+        payload_cgroup()?;
+        let path =
+            |text: &str| sys::cstring(text).map_err(|_| "a path holds a NUL byte".to_owned());
+        spawn.namespace = Some(process::Namespace {
+            cgroup_procs: path(&format!("{PAYLOAD_CGROUP}/cgroup.procs"))?,
+            console: (output == "/dev/hvc0").then(|| path(output)).transpose()?,
+        });
+    }
     process::spawn(&spawn).map_err(|error| match error {
         process::SpawnError::Parent(error) => format!("starting the process failed: {error}"),
         process::SpawnError::Child(stage, error) => {
@@ -433,7 +487,10 @@ fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
                 process::Stage::Output => "opening the output",
                 process::Stage::Workdir => "entering the working directory",
                 process::Stage::Identity => "switching to the user",
+                process::Stage::Exec if config.init_system => "executing the image's init",
                 process::Stage::Exec => "executing the command",
+                process::Stage::Namespace => "entering the init system's namespaces",
+                process::Stage::Mounts => "mounting the init system's namespace",
             };
             format!("{what} failed: {error}")
         }

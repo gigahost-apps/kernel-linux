@@ -1,6 +1,7 @@
-//! The machine's configuration, read from `fw_cfg` (interface versions 1
-//! and 2): the process to run, or (version 2's unpack mode) the image
-//! layers to unpack onto the root disk.
+//! The machine's configuration, read from `fw_cfg` (interface versions 1,
+//! 2 and 3): the process to run (from version 3, possibly the image's own
+//! init system), or (version 2's unpack mode) the image layers to unpack
+//! onto the root disk.
 //!
 //! The config may carry secrets (environment values, keys), so no error
 //! message here quotes a value: they name the field at most.
@@ -26,7 +27,10 @@ const DEFAULT_STOP_SIGNAL: i32 = 15;
 pub const MAX_SIGNAL: i32 = 64;
 
 /// The config versions this init accepts.
-pub const VERSIONS: &[u64] = &[1, 2];
+pub const VERSIONS: &[u64] = &[1, 2, 3];
+
+/// The first config version with `init_system`.
+const INIT_SYSTEM_VERSION: u64 = 3;
 
 /// The most layers an unpack config may list.
 pub const MAX_LAYERS: usize = 128;
@@ -111,6 +115,11 @@ pub struct Config {
     pub stop_signal: i32,
     #[serde(default)]
     pub authorized_keys: Option<AuthorizedKeys>,
+    /// Version 3: `argv` is the image's own init system (systemd, a
+    /// SysV-style or busybox init), run as PID 1 of a PID namespace of its
+    /// own.
+    #[serde(default)]
+    pub init_system: bool,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +140,7 @@ impl std::fmt::Debug for Config {
                 "authorized_keys",
                 &self.authorized_keys.as_ref().map(|keys| keys.keys.len()),
             )
+            .field("init_system", &self.init_system)
             .finish_non_exhaustive()
     }
 }
@@ -156,7 +166,14 @@ const FIELDS: &[&str] = &[
     "stop_timeout_seconds",
     "stop_signal",
     "authorized_keys",
+    "init_system",
 ];
+
+/// Whether `key` is a run field of config `version`: `init_system` is
+/// version 3's, unknown to versions 1 and 2.
+fn known_field(key: &str, version: u64) -> bool {
+    FIELDS.contains(&key) && (key != "init_system" || version >= INIT_SYSTEM_VERSION)
+}
 
 /// Names what in `value` keeps it from parsing, without quoting a value.
 fn diagnose(value: &Value, version: u64) -> String {
@@ -164,7 +181,7 @@ fn diagnose(value: &Value, version: u64) -> String {
         return "the config is not a JSON object".into();
     };
     for key in object.keys() {
-        if !FIELDS.contains(&key.as_str()) {
+        if !known_field(key, version) {
             return format!("the config has an unknown field `{}`", printable(key));
         }
     }
@@ -198,6 +215,12 @@ fn diagnose(value: &Value, version: u64) -> String {
         .is_some_and(|item| i32::deserialize(item).is_err())
     {
         return "config field `stop_signal` is not a signal number".into();
+    }
+    if object
+        .get("init_system")
+        .is_some_and(|item| !item.is_boolean())
+    {
+        return "config field `init_system` is not true or false".into();
     }
     if let Some(keys) = object.get("authorized_keys") {
         if let Some(inner) = keys.as_object() {
@@ -241,8 +264,10 @@ pub fn parse(bytes: &[u8], boot_version: u32) -> Result<Boot, String> {
     let version = match value.get("version").map(Value::as_u64) {
         None => return Err("config field `version` is missing".into()),
         Some(Some(version)) if version == u64::from(boot_version) => version,
-        // A version-1 boot answers as it always has.
-        Some(Some(version)) if boot_version != 1 && VERSIONS.contains(&version) => {
+        // A boot answers a later version as one it does not support, as it
+        // did before that version existed (a version-1 boot answers so
+        // for every other version).
+        Some(Some(version)) if VERSIONS.contains(&version) && version < u64::from(boot_version) => {
             return Err("the config's version is not the boot's interface version (gh.v)".into());
         }
         Some(_) => return Err("the config's version is not one this init supports".into()),
@@ -257,7 +282,7 @@ pub fn parse(bytes: &[u8], boot_version: u32) -> Result<Boot, String> {
         None => {}
         Some(Value::String(mode)) if mode == "run" => {}
         Some(Value::String(mode)) if mode == "unpack" => {
-            return unpack_config(object).map(Boot::Unpack);
+            return unpack_config(object, version).map(Boot::Unpack);
         }
         Some(_) => return Err("config field `mode` is not \"run\" or \"unpack\"".into()),
     }
@@ -270,18 +295,22 @@ pub fn parse(bytes: &[u8], boot_version: u32) -> Result<Boot, String> {
 
 /// The run mode's config, as version 1 has it.
 fn run_config(value: &Value, version: u64) -> Result<Config, String> {
+    if version < INIT_SYSTEM_VERSION && value.get("init_system").is_some() {
+        // Not a field of this version: refused as any unknown field.
+        return Err(diagnose(value, version));
+    }
     let config = Config::deserialize(value).map_err(|_| diagnose(value, version))?;
     check(&config)?;
     Ok(config)
 }
 
 /// The unpack mode's config: `version`, `mode` and `layers`, nothing else.
-fn unpack_config(object: &serde_json::Map<String, Value>) -> Result<Unpack, String> {
+fn unpack_config(object: &serde_json::Map<String, Value>, version: u64) -> Result<Unpack, String> {
     for key in object.keys() {
         if key == "mode" || key == "layers" {
             continue;
         }
-        if !FIELDS.contains(&key.as_str()) {
+        if !known_field(key, version) {
             return Err(format!(
                 "the config has an unknown field `{}`",
                 printable(key)
@@ -403,6 +432,9 @@ fn check(config: &Config) -> Result<(), String> {
             "config field `stop_signal` is not a signal number from 1 to {MAX_SIGNAL}"
         ));
     }
+    if config.init_system {
+        check_init_system(config)?;
+    }
     if let Some(keys) = &config.authorized_keys {
         if keys.user.is_empty() || keys.user.contains('\0') {
             return Err("config field `authorized_keys.user` is empty".into());
@@ -416,6 +448,32 @@ fn check(config: &Config) -> Result<(), String> {
                 "config field `authorized_keys.keys` holds an empty or multi-line key".into(),
             );
         }
+    }
+    Ok(())
+}
+
+/// The `user` values that name root (uid 0, gid 0) without looking at the
+/// image: absent, or root by name or number, with or without its group.
+const ROOT_USERS: &[&str] = &["", "root", "0", "root:root", "root:0", "0:root", "0:0"];
+
+/// What `init_system` requires of the rest of the run config: an absolute
+/// path to the image's init, root, and `/` as the working directory.
+fn check_init_system(config: &Config) -> Result<(), String> {
+    if !config
+        .argv
+        .first()
+        .is_some_and(|program| program.starts_with('/'))
+    {
+        return Err(
+            "config field `argv` does not start with an absolute path, which `init_system` requires"
+                .into(),
+        );
+    }
+    if !ROOT_USERS.contains(&config.user.as_deref().unwrap_or("")) {
+        return Err("config field `user` is not root, which `init_system` requires".into());
+    }
+    if config.workdir != "/" {
+        return Err("config field `workdir` is not /, which `init_system` requires".into());
     }
     Ok(())
 }
@@ -528,6 +586,148 @@ mod tests {
             parse_boot(r#"{"version": 1, "argv": ["a"], "layers": []}"#, 1).unwrap_err(),
             "the config has an unknown field `layers`"
         );
+    }
+
+    fn run_v3(text: &str) -> Result<Config, String> {
+        parse_boot(text, 3).map(|boot| match boot {
+            Boot::Run(config) => config,
+            Boot::Unpack(_) => panic!("not the run mode"),
+        })
+    }
+
+    #[test]
+    fn version_three_init_system() {
+        let config = run_v3(r#"{"version": 3, "argv": ["nginx"]}"#).unwrap();
+        assert!(!config.init_system);
+        assert_eq!(config.stop_signal, 15);
+        let config = run_v3(
+            r#"{"version": 3, "mode": "run", "argv": ["/sbin/init"], "init_system": true, "stop_signal": 37}"#,
+        )
+        .unwrap();
+        assert!(config.init_system);
+        assert_eq!(config.argv, ["/sbin/init"]);
+        assert_eq!(config.stop_signal, 37);
+        assert!(
+            !run_v3(r#"{"version": 3, "argv": ["a"], "init_system": false}"#)
+                .unwrap()
+                .init_system
+        );
+        for user in ["root", "0", "0:0", "root:root", "root:0", "0:root"] {
+            let text = format!(
+                r#"{{"version": 3, "argv": ["/sbin/init"], "init_system": true, "user": "{user}", "workdir": "/"}}"#
+            );
+            assert!(run_v3(&text).is_ok(), "{user}");
+        }
+        for user in ["nobody", "1000", "0:1", "root:adm", "1:0", "root "] {
+            let text = format!(
+                r#"{{"version": 3, "argv": ["/sbin/init"], "init_system": true, "user": "{user}"}}"#
+            );
+            assert_eq!(
+                run_v3(&text).unwrap_err(),
+                "config field `user` is not root, which `init_system` requires",
+                "{user}"
+            );
+        }
+        assert_eq!(
+            run_v3(
+                r#"{"version": 3, "argv": ["/sbin/init"], "init_system": true, "workdir": "/srv"}"#
+            )
+            .unwrap_err(),
+            "config field `workdir` is not /, which `init_system` requires"
+        );
+        assert_eq!(
+            run_v3(r#"{"version": 3, "argv": ["init"], "init_system": true}"#).unwrap_err(),
+            "config field `argv` does not start with an absolute path, which `init_system` requires"
+        );
+        // Without init_system, the same fields are v2's run mode.
+        assert!(
+            run_v3(r#"{"version": 3, "argv": ["init"], "user": "nobody", "workdir": "/srv"}"#)
+                .is_ok()
+        );
+        for value in ["1", r#""true""#, "null", "[]"] {
+            let text =
+                format!(r#"{{"version": 3, "argv": ["/sbin/init"], "init_system": {value}}}"#);
+            assert_eq!(
+                run_v3(&text).unwrap_err(),
+                "config field `init_system` is not true or false",
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_system_unknown_before_version_three() {
+        assert_eq!(
+            parse_text(r#"{"version": 1, "argv": ["/sbin/init"], "init_system": true}"#)
+                .unwrap_err(),
+            "the config has an unknown field `init_system`"
+        );
+        for text in [
+            r#"{"version": 2, "argv": ["/sbin/init"], "init_system": true}"#,
+            r#"{"version": 2, "mode": "run", "argv": ["/sbin/init"], "init_system": false}"#,
+        ] {
+            assert_eq!(
+                parse_boot(text, 2).unwrap_err(),
+                "the config has an unknown field `init_system`",
+                "{text}"
+            );
+        }
+        // The first unknown field is named, as before version 3.
+        assert_eq!(
+            parse_boot(
+                r#"{"version": 2, "argv": ["a"], "init_system": true, "a": 1}"#,
+                2
+            )
+            .unwrap_err(),
+            "the config has an unknown field `a`"
+        );
+        let text = format!(
+            r#"{{"version": 2, "mode": "unpack", "init_system": true, "layers": [{}]}}"#,
+            layer_json(TAR, DIGEST, "1")
+        );
+        assert_eq!(
+            parse_boot(&text, 2).unwrap_err(),
+            "the config has an unknown field `init_system`"
+        );
+        let text = format!(
+            r#"{{"version": 3, "mode": "unpack", "init_system": true, "layers": [{}]}}"#,
+            layer_json(TAR, DIGEST, "1")
+        );
+        assert_eq!(
+            parse_boot(&text, 3).unwrap_err(),
+            "config field `init_system` is not taken in the unpack mode"
+        );
+        let text = format!(
+            r#"{{"version": 3, "mode": "unpack", "layers": [{}]}}"#,
+            layer_json(TAR, DIGEST, "1")
+        );
+        assert!(matches!(parse_boot(&text, 3), Ok(Boot::Unpack(_))));
+    }
+
+    #[test]
+    fn version_three_boot() {
+        for (config, boot, error) in [
+            (
+                2,
+                3,
+                "the config's version is not the boot's interface version (gh.v)",
+            ),
+            (
+                1,
+                3,
+                "the config's version is not the boot's interface version (gh.v)",
+            ),
+            (4, 3, "the config's version is not one this init supports"),
+            (3, 2, "the config's version is not one this init supports"),
+            (3, 1, "the config's version is not one this init supports"),
+        ] {
+            let text = format!(r#"{{"version": {config}, "argv": ["a"]}}"#);
+            assert_eq!(
+                parse_boot(&text, boot).unwrap_err(),
+                error,
+                "{config} on {boot}"
+            );
+        }
     }
 
     #[test]

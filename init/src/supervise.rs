@@ -82,14 +82,36 @@ impl Shared {
     }
 }
 
+/// Why the main process ended, from how it ended: after a stop command it
+/// was stopped, whatever its status. An init system (version 3's
+/// `init_system`) that asked for a power-off, a halt or a reboot ends as
+/// the kernel ends a PID namespace's init then (`reboot(2)` there, see
+/// `pid_namespaces(7)`): killed by SIGINT for a power-off or a halt, by
+/// SIGHUP for a reboot. Nothing else kills it by those signals: no process
+/// of its namespace can, and this init sends neither unless they are the
+/// stop signal, after which it is stopped.
+fn reason(ended: Ended, stop_requested: bool, init_system: bool) -> Reason {
+    if stop_requested {
+        return Reason::Stopped;
+    }
+    match ended {
+        Ended::Signaled(libc::SIGINT) if init_system => Reason::Poweroff,
+        Ended::Signaled(libc::SIGHUP) if init_system => Reason::Reboot,
+        _ => Reason::Exited,
+    }
+}
+
 /// Reaps every child until the main process ends, then ends the machine.
 /// A stop sends `stop_signal` to `main` first and waits
 /// `default_timeout_seconds` unless the command gives a timeout.
+/// `init_system`: `main` is the image's init in a PID namespace of its
+/// own (version 3), whose power-off and reboot are reported as such.
 pub fn run(
     main: i32,
     listener: Option<vsock::Listener>,
     stop_signal: i32,
     default_timeout_seconds: u32,
+    init_system: bool,
 ) -> ! {
     let shared = Arc::new(Shared {
         main,
@@ -117,11 +139,7 @@ pub fn run(
                 let reason = {
                     let mut state = shared.lock();
                     state.main_ended = true;
-                    if state.stop_requested {
-                        Reason::Stopped
-                    } else {
-                        Reason::Exited
-                    }
+                    reason(ended, state.stop_requested, init_system)
                 };
                 process::reap(pid);
                 finish(Some(ended), reason);
@@ -241,6 +259,46 @@ mod tests {
         fn drop(&mut self) {
             self.0.lock().main_ended = true;
         }
+    }
+
+    #[test]
+    fn reasons() {
+        use super::Ended as How;
+        let int = How::Signaled(libc::SIGINT);
+        let hup = How::Signaled(libc::SIGHUP);
+        assert_eq!(reason(int, false, true), Reason::Poweroff);
+        assert_eq!(reason(hup, false, true), Reason::Reboot);
+        // A stop that ends in the init system's power-off was a stop.
+        assert_eq!(reason(int, true, true), Reason::Stopped);
+        assert_eq!(reason(hup, true, true), Reason::Stopped);
+        assert_eq!(reason(How::Exited(0), false, true), Reason::Exited);
+        assert_eq!(reason(How::Signaled(9), false, true), Reason::Exited);
+        // A plain process killed by SIGINT or SIGHUP just exited.
+        assert_eq!(reason(int, false, false), Reason::Exited);
+        assert_eq!(reason(hup, false, false), Reason::Exited);
+        assert_eq!(reason(How::Exited(3), true, false), Reason::Stopped);
+    }
+
+    /// The stop goes to the init system's PID (the namespace's PID 1, by
+    /// its PID here) with the config's signal, SIGRTMIN+3 for systemd.
+    #[test]
+    fn a_stop_sends_an_init_system_its_signal() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let sigrtmin_3 = libc::SIGRTMIN() + 3;
+        let shared = Arc::new(Shared {
+            main: i32::try_from(child.id()).unwrap(),
+            stop_signal: sigrtmin_3,
+            default_timeout_seconds: 300,
+            state: Mutex::new(State::default()),
+        });
+        let guard = Ended(Arc::clone(&shared));
+        shared.request_stop(None);
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(sigrtmin_3));
+        drop(guard);
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! The JSON lines between the init and the host (interface versions 1
-//! and 2): the reports the init sends, the commands it accepts and its
+//! The JSON lines between the init and the host (interface versions 1, 2
+//! and 3): the reports the init sends, the commands it accepts and its
 //! answers.
 
 use crate::config::MAX_STOP_TIMEOUT_SECONDS;
@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The interface versions whose lines this init speaks.
-pub const VERSIONS: &[u32] = &[1, 2];
+pub const VERSIONS: &[u32] = &[1, 2, 3];
 
 /// The boot's interface version (`gh.v`), which every line carries as
 /// `v`; 1 until the command line names a supported one.
@@ -40,6 +40,11 @@ pub enum Reason {
     Error,
     /// The unpack mode (version 2) unpacked every layer.
     Unpacked,
+    /// Version 3's `init_system`: the image's init powered the container
+    /// off (or halted it).
+    Poweroff,
+    /// Version 3's `init_system`: the image's init rebooted the container.
+    Reboot,
 }
 
 /// One report, sent once per event.
@@ -297,6 +302,36 @@ mod tests {
             Err("unsupported interface version")
         );
         assert_eq!(encode_answer(Ok(()), 2), r#"{"v":2,"ok":true}"#);
+    }
+
+    #[test]
+    fn version_three_reasons() {
+        let report = |reason| Report {
+            v: 3,
+            ..Report::exited(None, Some(2), reason)
+        };
+        assert_eq!(
+            report(Reason::Poweroff).encode(),
+            r#"{"v":3,"event":"exited","code":null,"signal":2,"reason":"poweroff"}"#
+        );
+        assert_eq!(
+            report(Reason::Reboot).encode(),
+            r#"{"v":3,"event":"exited","code":null,"signal":2,"reason":"reboot"}"#
+        );
+        for reason in [Reason::Poweroff, Reason::Reboot] {
+            let decoded: Report = serde_json::from_str(&report(reason).encode()).unwrap();
+            assert_eq!(decoded, report(reason));
+        }
+        assert_eq!(
+            decode_command(r#"{"v":3,"command":"stop","timeout_seconds":5}"#, 3),
+            Ok(Command::Stop {
+                timeout_seconds: Some(5)
+            })
+        );
+        assert_eq!(
+            decode_command(r#"{"v":2,"command":"stop"}"#, 3),
+            Err("unsupported interface version")
+        );
     }
 
     #[test]

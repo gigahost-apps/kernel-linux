@@ -16,6 +16,19 @@ pub struct Spawn {
     pub uid: u32,
     pub gid: u32,
     pub groups: Vec<u32>,
+    /// Version 3's `init_system`: start the program as PID 1 of PID,
+    /// mount and cgroup namespaces of its own.
+    pub namespace: Option<Namespace>,
+}
+
+/// Where an init system's namespaces start.
+pub struct Namespace {
+    /// The `cgroup.procs` of the cgroup that becomes the cgroup
+    /// namespace's root.
+    pub cgroup_procs: CString,
+    /// The device bound over `/dev/console` inside, when there is one
+    /// (`/dev/hvc0`).
+    pub console: Option<CString>,
 }
 
 impl Spawn {
@@ -42,6 +55,7 @@ impl Spawn {
             uid: identity.0,
             gid: identity.1,
             groups: identity.2.to_vec(),
+            namespace: None,
         })
     }
 }
@@ -54,7 +68,19 @@ pub enum Stage {
     Workdir,
     Identity,
     Exec,
+    /// Moving into the cgroup, unsharing the namespaces, forking their
+    /// PID 1.
+    Namespace,
+    /// The namespace's own mounts.
+    Mounts,
 }
+
+/// `CAP_SYS_MODULE` of `<linux/capability.h>`.
+const CAP_SYS_MODULE: libc::c_ulong = 16;
+
+/// The message tag that carries the namespace's PID 1 (its PID here)
+/// instead of an error.
+const PID_TAG: u8 = 0;
 
 impl Stage {
     fn code(self) -> u8 {
@@ -63,6 +89,8 @@ impl Stage {
             Stage::Workdir => 2,
             Stage::Identity => 3,
             Stage::Exec => 4,
+            Stage::Namespace => 5,
+            Stage::Mounts => 6,
         }
     }
 
@@ -71,6 +99,8 @@ impl Stage {
             1 => Stage::Output,
             2 => Stage::Workdir,
             3 => Stage::Identity,
+            5 => Stage::Namespace,
+            6 => Stage::Mounts,
             _ => Stage::Exec,
         }
     }
@@ -89,6 +119,11 @@ pub enum SpawnError {
 /// /dev/null, stdout and stderr to `output`, a new session, the working
 /// directory, then the user's groups, group and user. Returns the child's
 /// PID once `execve` succeeded.
+///
+/// With [`Spawn::namespace`] a first child moves into the cgroup,
+/// unshares the PID, mount and cgroup namespaces and forks the process,
+/// which is PID 1 inside them, then exits: the process becomes this
+/// init's child, and its PID here is the one returned.
 pub fn spawn(spec: &Spawn) -> Result<i32, SpawnError> {
     let mut argv: Vec<*const libc::c_char> = spec.argv.iter().map(|a| a.as_ptr()).collect();
     argv.push(ptr::null());
@@ -110,13 +145,65 @@ pub fn spawn(spec: &Spawn) -> Result<i32, SpawnError> {
     }
     if pid == 0 {
         close(read_end);
-        child(spec, &argv, &env, write_end);
+        match &spec.namespace {
+            None => child(spec, &argv, &env, write_end),
+            Some(namespace) => namespace_parent(spec, namespace, &argv, &env, write_end),
+        }
     }
     close(write_end);
-    let mut report = [0u8; 5];
+    let result = if spec.namespace.is_some() {
+        namespace_result(pid, read_end)
+    } else {
+        // The pipe closes on a successful execve.
+        match read_message(read_end) {
+            None => Ok(pid),
+            Some(message) => {
+                reap(pid);
+                Err(child_error(message))
+            }
+        }
+    };
+    close(read_end);
+    result
+}
+
+/// The namespace's start, from the first child's messages: its PID 1's
+/// PID, then nothing on a successful execve.
+fn namespace_result(first: i32, read_end: libc::c_int) -> Result<i32, SpawnError> {
+    let message = read_message(read_end);
+    // The first child exits once it has forked (or failed); reaping it
+    // makes the process this init's child.
+    reap(first);
+    let main = match message {
+        Some([PID_TAG, a, b, c, d]) => i32::from_ne_bytes([a, b, c, d]),
+        Some(message) => return Err(child_error(message)),
+        None => {
+            return Err(SpawnError::Child(
+                Stage::Namespace,
+                io::Error::from_raw_os_error(libc::EIO),
+            ));
+        }
+    };
+    match read_message(read_end) {
+        None => Ok(main),
+        Some(message) => {
+            reap(main);
+            Err(child_error(message))
+        }
+    }
+}
+
+fn child_error([stage, a, b, c, d]: [u8; 5]) -> SpawnError {
+    let error = io::Error::from_raw_os_error(i32::from_ne_bytes([a, b, c, d]));
+    SpawnError::Child(Stage::from_code(stage), error)
+}
+
+/// One 5-byte message from the pipe, or `None` when it closed first.
+fn read_message(read_end: libc::c_int) -> Option<[u8; 5]> {
+    let mut message = [0u8; 5];
     let mut got = 0;
-    while got < report.len() {
-        let rest = report.get_mut(got..).unwrap_or_default();
+    while got < message.len() {
+        let rest = message.get_mut(got..).unwrap_or_default();
         // SAFETY: the pointer and length describe the live slice `rest`.
         let count = unsafe { libc::read(read_end, rest.as_mut_ptr().cast(), rest.len()) };
         match usize::try_from(count) {
@@ -126,15 +213,7 @@ pub fn spawn(spec: &Spawn) -> Result<i32, SpawnError> {
             Err(_) => break,
         }
     }
-    close(read_end);
-    if got == 0 {
-        // The pipe closed on a successful execve.
-        return Ok(pid);
-    }
-    let [stage, a, b, c, d] = report;
-    let error = io::Error::from_raw_os_error(i32::from_ne_bytes([a, b, c, d]));
-    reap(pid);
-    Err(SpawnError::Child(Stage::from_code(stage), error))
+    (got > 0).then_some(message)
 }
 
 fn close(fd: libc::c_int) {
@@ -145,6 +224,125 @@ fn close(fd: libc::c_int) {
 /// The highest signal number on Linux (`SIGRTMAX`, `_NSIG - 1`).
 pub const SIGNAL_MAX: libc::c_int = 64;
 
+/// Writes `[stage, errno]` to the pipe and leaves the child.
+fn fail_child(report: libc::c_int, stage: Stage) -> ! {
+    let code = errno().raw_os_error().unwrap_or(libc::EIO).to_ne_bytes();
+    let [a, b, c, d] = code;
+    let message = [stage.code(), a, b, c, d];
+    // SAFETY: writing a live 5-byte array, then leaving the child
+    // without running any of the parent's exit handlers.
+    unsafe {
+        libc::write(report, message.as_ptr().cast(), message.len());
+        libc::_exit(127)
+    }
+}
+
+/// The first child of an init system's start: into the cgroup, out of
+/// the namespaces, the fork of their PID 1, whose PID it sends before it
+/// exits. Never returns.
+fn namespace_parent(
+    spec: &Spawn,
+    namespace: &Namespace,
+    argv: &[*const libc::c_char],
+    env: &[*const libc::c_char],
+    report: libc::c_int,
+) -> ! {
+    // SAFETY: plain system calls on values prepared before the fork.
+    unsafe {
+        // Into the cgroup first, so the new cgroup namespace's root is
+        // that cgroup.
+        let procs = libc::open(
+            namespace.cgroup_procs.as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        );
+        if procs < 0 || libc::write(procs, c"0".as_ptr().cast(), 1) != 1 {
+            fail_child(report, Stage::Namespace);
+        }
+        libc::close(procs);
+        if libc::unshare(libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP) < 0 {
+            fail_child(report, Stage::Namespace);
+        }
+        // This process stays in the parent PID namespace; its child is
+        // the new namespace's PID 1.
+        let pid = libc::fork();
+        if pid < 0 {
+            fail_child(report, Stage::Namespace);
+        }
+        if pid == 0 {
+            if namespace_mounts(namespace).is_err() {
+                fail_child(report, Stage::Mounts);
+            }
+            // The kernel loads no modules: without the capability in the
+            // bounding set the image's init knows it, as under a
+            // container manager, instead of failing to load any.
+            if libc::prctl(libc::PR_CAPBSET_DROP, CAP_SYS_MODULE, 0, 0, 0) < 0 {
+                fail_child(report, Stage::Namespace);
+            }
+            child(spec, argv, env, report);
+        }
+        let [a, b, c, d] = pid.to_ne_bytes();
+        let message = [PID_TAG, a, b, c, d];
+        libc::write(report, message.as_ptr().cast(), message.len());
+        // Leaves the cgroup to the namespace's PID 1 alone, as cgroup v2
+        // wants of a cgroup whose children use controllers.
+        libc::_exit(0)
+    }
+}
+
+/// The namespace's own mounts, from its PID 1 before `execve`, as
+/// container managers set them up for an init system: nothing propagates
+/// back, a `/proc` of the new PID namespace, `/sys` read-only (so the
+/// image's init manages no devices) but for a writable cgroup2 at
+/// `/sys/fs/cgroup` that shows the cgroup namespace's root, and the
+/// output device as `/dev/console`.
+fn namespace_mounts(namespace: &Namespace) -> Result<(), ()> {
+    let quiet = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    let ok = |rc: libc::c_int| if rc < 0 { Err(()) } else { Ok(()) };
+    // SAFETY: every pointer is null or a NUL-terminated literal or a C
+    // string prepared before the fork.
+    unsafe {
+        ok(libc::mount(
+            ptr::null(),
+            c"/".as_ptr(),
+            ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            ptr::null(),
+        ))?;
+        ok(libc::mount(
+            c"proc".as_ptr(),
+            c"/proc".as_ptr(),
+            c"proc".as_ptr(),
+            quiet,
+            ptr::null(),
+        ))?;
+        ok(libc::mount(
+            ptr::null(),
+            c"/sys".as_ptr(),
+            ptr::null(),
+            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | quiet,
+            ptr::null(),
+        ))?;
+        ok(libc::umount2(c"/sys/fs/cgroup".as_ptr(), libc::MNT_DETACH))?;
+        ok(libc::mount(
+            c"cgroup2".as_ptr(),
+            c"/sys/fs/cgroup".as_ptr(),
+            c"cgroup2".as_ptr(),
+            quiet,
+            ptr::null(),
+        ))?;
+        if let Some(console) = &namespace.console {
+            ok(libc::mount(
+                console.as_ptr(),
+                c"/dev/console".as_ptr(),
+                ptr::null(),
+                libc::MS_BIND,
+                ptr::null(),
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 /// The forked child: never returns.
 fn child(
     spec: &Spawn,
@@ -152,17 +350,7 @@ fn child(
     env: &[*const libc::c_char],
     report: libc::c_int,
 ) -> ! {
-    let fail = |stage: Stage| -> ! {
-        let code = errno().raw_os_error().unwrap_or(libc::EIO).to_ne_bytes();
-        let [a, b, c, d] = code;
-        let message = [stage.code(), a, b, c, d];
-        // SAFETY: writing a live 5-byte array, then leaving the child
-        // without running any of the parent's exit handlers.
-        unsafe {
-            libc::write(report, message.as_ptr().cast(), message.len());
-            libc::_exit(127)
-        }
-    };
+    let fail = |stage: Stage| -> ! { fail_child(report, stage) };
     // SAFETY: plain system calls on values prepared before the fork; the
     // sigset is initialised by sigemptyset before use.
     unsafe {
