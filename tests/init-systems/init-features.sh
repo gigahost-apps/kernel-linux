@@ -85,7 +85,7 @@ check cgroup_root cgroup_root
 check cgroup_mount cgroup_mount
 check cgroup_writable sh -c 'mkdir /sys/fs/cgroup/init-features && rmdir /sys/fs/cgroup/init-features'
 check sys_readonly sh -c 'grep " /sys sysfs " /proc/mounts | grep -q "[ ,]ro[ ,]"'
-check no_init_of_the_machine sh -c '! grep -q -s gigahost-init /proc/*/comm'
+check no_kernel_threads_of_the_machine sh -c '! grep -q -x -s kthreadd /proc/*/comm'
 check address4 sh -c 'ip -4 addr show eth0 | grep -q "inet 10.115.0.15/24"'
 check address6 sh -c 'ip -6 addr show eth0 | grep -q "inet6 fd15:115::15/64"'
 echo "INFO $(grep MemAvailable /proc/meminfo | tr -s ' ')"

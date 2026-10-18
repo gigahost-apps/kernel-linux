@@ -292,6 +292,12 @@ signal on which the image's init shuts down:
 | busybox init (Alpine's `/sbin/init`, running OpenRC from `/etc/inittab`) | 12 (`SIGUSR2`) | Power-off: the `::shutdown:` entries (`openrc shutdown`), then every process killed. `SIGUSR1` halts, `SIGTERM` reboots. |
 | `openrc-init` | 15 (`SIGTERM`) | Halt: the `shutdown` runlevel, then every process killed. `SIGINT` reboots. |
 
+The kernel delivers to a PID namespace's init, from outside it, only the
+signals the init handles (and SIGKILL), so the stop signal must be the one
+on which the image's init shuts down. With systemd and the default 15, a
+stop ends only by the timeout's SIGKILL: systemd re-executes itself on
+SIGTERM.
+
 Whatever the image's init does then, the `exited` report says `stopped`.
 
 ### Reasons
