@@ -564,12 +564,14 @@ init_system_boot() {
 }
 
 # expect_init_features COUNT: COUNT passing checks and no failing one.
+# An image's init that never ran the checks prints no INFO line, which
+# must not end the script before the case's logs are shown.
 expect_init_features() {
     local passed
     passed=$(grep -a -c '^FEATURE [a-z0-9_]* PASS$' "${case_dir}/console.txt" || true)
     [[ ${passed} == "$1" ]] || fail "expected $1 passing init-system checks, got ${passed}"
     expect_absent console.txt ' FAIL'
-    grep -a '^INFO ' "${case_dir}/console.txt" | sed 's/^/  /'
+    grep -a '^INFO ' "${case_dir}/console.txt" | sed 's/^/  /' || true
 }
 
 # init_system_cases NAME CONTAINERFILE STOP_SIGNAL CHECKS
