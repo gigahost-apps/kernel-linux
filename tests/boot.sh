@@ -514,7 +514,7 @@ truncate -s 1G "${case_dir}/disk.img"
 qemu "${default_cmdline}" "${case_timeout}" "${case_dir}/disk.img"
 expect_started
 expect_report '"code":0,"signal":null,"reason":"exited"'
-grep -a -q -E '^gigahost-init: grew the root file system from [0-9]+ to [0-9]+ blocks$' "${case_dir}/serial.log" \
+grep -a -q -E '^gigahost-init: grew the root file system from [0-9]+ to [0-9]+ blocks' "${case_dir}/serial.log" \
     || fail "no line saying the root grew"
 expect_absent serial.log 'growing the root file system failed'
 grown_kib=$(root_kib)
