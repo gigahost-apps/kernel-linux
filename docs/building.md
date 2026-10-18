@@ -113,8 +113,11 @@ version 3's init systems: two images built from `tests/init-systems/`
 (Debian with systemd, Alpine with busybox init running OpenRC), unpacked
 by a version-3 unpack boot, each booted twice, whose checks
 (`init-features.sh`: the image's init is PID 1 of its namespace, systemd
-reaches `running`, the journal and cron work, `/sys/fs/cgroup` is the
-namespace's and writable, `/sys` is read-only, the addresses are set)
+reaches `running`, the journal and cron work, the cgroup namespace's root
+is the `payload` cgroup (no cgroup path seen from inside names it,
+`/sys/fs/cgroup` shows it as `/` and is writable, the image's init is in
+`/init.scope` for systemd and `/` for busybox init), `/sys` is
+read-only, the addresses are set)
 pass before the image's init powers off, and reboots, from inside, as
 the reports say. The cases print the boot time and the guest's
 `MemAvailable` at 256 MiB. It needs `podman`, QEMU, `/dev/kvm`,

@@ -596,8 +596,8 @@ init_system_cases() {
 
 # systemd stops on SIGRTMIN+3 (37 with glibc), busybox init powers off on
 # SIGUSR2 (12).
-init_system_cases systemd Containerfile.debian 37 10
-init_system_cases openrc Containerfile.alpine 12 9
+init_system_cases systemd Containerfile.debian 37 12
+init_system_cases openrc Containerfile.alpine 12 11
 
 if [[ ${failures} != 0 ]]; then
     echo "boot.sh: ${failures} check(s) failed"

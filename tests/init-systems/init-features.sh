@@ -33,6 +33,21 @@ wait_for() {
     return 1
 }
 
+# The cgroup namespace's root is the cgroup the init made for the image
+# (payload): seen from inside, no cgroup path names it, and the cgroup2 on
+# /sys/fs/cgroup shows that root, so the script's own cgroup is in it at
+# the path /proc/self/cgroup gives. Without the cgroup namespace the paths
+# start with /payload; with the machine's cgroup2 left on /sys/fs/cgroup,
+# payload is a directory there.
+cgroup_root() {
+    grep -q -x '0::/.*' /proc/self/cgroup && ! grep -q payload /proc/self/cgroup
+}
+
+cgroup_mount() {
+    ! test -e /sys/fs/cgroup/payload \
+        && test -d "/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+}
+
 openrc_settled() {
     [ "$(cat /run/openrc/softlevel 2> /dev/null)" = default ] \
         && ! rc-status --all 2> /dev/null | grep -q -E 'starting|stopping'
@@ -45,7 +60,9 @@ if [ "${kind}" = systemd ]; then
     systemctl --failed --no-legend --plain 2> /dev/null | sed 's/^/INFO failed /'
     check running test "${state}" = running
     check pid1 test "$(cat /proc/1/comm)" = systemd
-    echo "INFO pid1_cgroup $(cat /proc/1/cgroup)"
+    # systemd at the root of its cgroup namespace moves itself to
+    # init.scope, as under any container manager.
+    check pid1_cgroup test "$(cat /proc/1/cgroup)" = 0::/init.scope
     echo "INFO virtualization $(systemd-detect-virt 2> /dev/null)"
     marker=init-features-$$
     echo "${marker}" | systemd-cat -t init-features
@@ -58,9 +75,14 @@ else
     rc-status --all 2> /dev/null | sed 's/^/INFO rc-status /'
     check running openrc_settled
     check pid1 test "$(readlink /proc/1/exe)" = /bin/busybox
+    # busybox init stays where it started: the cgroup namespace's root.
+    check pid1_cgroup test "$(cat /proc/1/cgroup)" = 0::/
     check cron pidof crond
 fi
-check cgroup_root grep -q -x '0::/.*' /proc/self/cgroup
+echo "INFO pid1_cgroup $(cat /proc/1/cgroup)"
+echo "INFO own_cgroup $(cat /proc/self/cgroup)"
+check cgroup_root cgroup_root
+check cgroup_mount cgroup_mount
 check cgroup_writable sh -c 'mkdir /sys/fs/cgroup/init-features && rmdir /sys/fs/cgroup/init-features'
 check sys_readonly sh -c 'grep " /sys sysfs " /proc/mounts | grep -q "[ ,]ro[ ,]"'
 check no_init_of_the_machine sh -c '! grep -q -s gigahost-init /proc/*/comm'
