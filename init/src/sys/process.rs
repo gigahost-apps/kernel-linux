@@ -123,7 +123,9 @@ pub enum SpawnError {
 /// With [`Spawn::namespace`] a first child moves into the cgroup,
 /// unshares the PID, mount and cgroup namespaces and forks the process,
 /// which is PID 1 inside them, then exits: the process becomes this
-/// init's child, and its PID here is the one returned.
+/// init's child, and its PID here is the one returned. The process waits
+/// before anything else until this init has reaped the first child, so
+/// the cgroup holds only the process when it execs.
 pub fn spawn(spec: &Spawn) -> Result<i32, SpawnError> {
     let mut argv: Vec<*const libc::c_char> = spec.argv.iter().map(|a| a.as_ptr()).collect();
     argv.push(ptr::null());
@@ -133,6 +135,22 @@ pub fn spawn(spec: &Spawn) -> Result<i32, SpawnError> {
     // SAFETY: `fds` has room for the two descriptors pipe2 writes.
     check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }).map_err(SpawnError::Parent)?;
     let [read_end, write_end] = fds;
+    // An init system's gate: its PID 1 waits for the end of file, which
+    // comes once this init has reaped the first child and closed the
+    // write end, so the image's init never runs while the first child is
+    // still in the cgroup.
+    let gate = if spec.namespace.is_some() {
+        let mut gate = [0 as libc::c_int; 2];
+        // SAFETY: `gate` has room for the two descriptors pipe2 writes.
+        if let Err(error) = check(unsafe { libc::pipe2(gate.as_mut_ptr(), libc::O_CLOEXEC) }) {
+            close(read_end);
+            close(write_end);
+            return Err(SpawnError::Parent(error));
+        }
+        Some(gate)
+    } else {
+        None
+    };
     // SAFETY: fork has no memory preconditions. The init forks while it
     // has a single thread, and the child below only makes system calls on
     // memory prepared before the fork.
@@ -141,18 +159,26 @@ pub fn spawn(spec: &Spawn) -> Result<i32, SpawnError> {
         let error = errno();
         close(read_end);
         close(write_end);
+        if let Some([gate_read, gate_write]) = gate {
+            close(gate_read);
+            close(gate_write);
+        }
         return Err(SpawnError::Parent(error));
     }
     if pid == 0 {
         close(read_end);
-        match &spec.namespace {
-            None => child(spec, &argv, &env, write_end),
-            Some(namespace) => namespace_parent(spec, namespace, &argv, &env, write_end),
+        match (&spec.namespace, gate) {
+            (Some(namespace), Some([gate_read, gate_write])) => {
+                close(gate_write);
+                namespace_parent(spec, namespace, &argv, &env, write_end, gate_read)
+            }
+            _ => child(spec, &argv, &env, write_end),
         }
     }
     close(write_end);
-    let result = if spec.namespace.is_some() {
-        namespace_result(pid, read_end)
+    let result = if let Some([gate_read, gate_write]) = gate {
+        close(gate_read);
+        namespace_result(pid, read_end, gate_write)
     } else {
         // The pipe closes on a successful execve.
         match read_message(read_end) {
@@ -168,12 +194,19 @@ pub fn spawn(spec: &Spawn) -> Result<i32, SpawnError> {
 }
 
 /// The namespace's start, from the first child's messages: its PID 1's
-/// PID, then nothing on a successful execve.
-fn namespace_result(first: i32, read_end: libc::c_int) -> Result<i32, SpawnError> {
+/// PID, then nothing on a successful execve. `gate` is the write end its
+/// PID 1 waits on, closed once the first child is reaped.
+fn namespace_result(
+    first: i32,
+    read_end: libc::c_int,
+    gate: libc::c_int,
+) -> Result<i32, SpawnError> {
     let message = read_message(read_end);
     // The first child exits once it has forked (or failed); reaping it
-    // makes the process this init's child.
+    // makes the process this init's child, and its exit has taken it out
+    // of the cgroup: the image's init may go on.
     reap(first);
+    close(gate);
     let main = match message {
         Some([PID_TAG, a, b, c, d]) => i32::from_ne_bytes([a, b, c, d]),
         Some(message) => return Err(child_error(message)),
@@ -239,13 +272,15 @@ fn fail_child(report: libc::c_int, stage: Stage) -> ! {
 
 /// The first child of an init system's start: into the cgroup, out of
 /// the namespaces, the fork of their PID 1, whose PID it sends before it
-/// exits. Never returns.
+/// exits. Their PID 1 first waits for the end of file on `gate`. Never
+/// returns.
 fn namespace_parent(
     spec: &Spawn,
     namespace: &Namespace,
     argv: &[*const libc::c_char],
     env: &[*const libc::c_char],
     report: libc::c_int,
+    gate: libc::c_int,
 ) -> ! {
     // SAFETY: plain system calls on values prepared before the fork.
     unsafe {
@@ -269,6 +304,8 @@ fn namespace_parent(
             fail_child(report, Stage::Namespace);
         }
         if pid == 0 {
+            wait_for_end_of_file(gate);
+            libc::close(gate);
             if namespace_mounts(namespace).is_err() {
                 fail_child(report, Stage::Mounts);
             }
@@ -286,6 +323,20 @@ fn namespace_parent(
         // Leaves the cgroup to the namespace's PID 1 alone, as cgroup v2
         // wants of a cgroup whose children use controllers.
         libc::_exit(0)
+    }
+}
+
+/// Reads `fd` until the end of file (or an error other than an
+/// interruption): the wait of an init system's PID 1 for the first child
+/// to be reaped. Async-signal-safe, for a forked child.
+fn wait_for_end_of_file(fd: libc::c_int) {
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: reading at most one byte into the live `byte`.
+        let count = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+        if count == 0 || (count < 0 && errno().kind() != io::ErrorKind::Interrupted) {
+            return;
+        }
     }
 }
 

@@ -252,7 +252,10 @@ namespace, run an init system. After steps 1–7, instead of step 8:
    `payload`) and forks the image's init, which is PID 1 of the new PID
    namespace, then exits: the image's init is the init's child, `payload`
    holds no other process, and the init knows it by its PID in the
-   machine's namespace (the `pid` of `started`).
+   machine's namespace (the `pid` of `started`). The image's init waits,
+   before anything else, until the init has reaped the first child, so
+   `payload` holds only the image's init from its first instruction on
+   (since release 6.18.57-gh4).
 3. **mounts**, inside the new mount namespace, which shares nothing back
    (every mount private): a new `proc` on `/proc` (the namespace's
    processes only); `/sys` read-only (as container managers mount it, so
