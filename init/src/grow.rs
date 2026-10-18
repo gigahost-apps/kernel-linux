@@ -89,7 +89,18 @@ fn grow(disk: &str) -> Result<(), String> {
         return Ok(());
     };
     let root = fs::File::open("/").map_err(|error| format!("opening /: {error}"))?;
-    disk::resize_ext4(root.as_fd(), blocks).map_err(|error| error.to_string())?;
+    disk::resize_ext4(root.as_fd(), blocks).map_err(|error| {
+        // The kernel's own reason is a warning the quiet console hides.
+        let hint = if error.raw_os_error() == Some(libc::EPERM) {
+            " (the file system has errors: run e2fsck on the disk)"
+        } else {
+            ""
+        };
+        format!(
+            "from {} to {blocks} blocks: {error}{hint}",
+            superblock.blocks
+        )
+    })?;
     log(&format!(
         "grew the root file system from {} to {blocks} blocks",
         superblock.blocks

@@ -541,6 +541,18 @@ expect_absent serial.log 'growing the root file system failed'
 kib=$(root_kib)
 (( kib > 200000 && kib < 270000 )) || fail "the root of a 256 MiB disk has ${kib} KiB"
 show_logs "${before}"
+before=${failures}
+new_case grow-refused "${root_kib_config}"
+cp --sparse=always "${work}/disk.img" "${case_dir}/disk.img"
+debugfs -w -R 'ssv state 3' "${case_dir}/disk.img" > /dev/null 2>&1
+truncate -s 1G "${case_dir}/disk.img"
+qemu "${default_cmdline}" "${case_timeout}" "${case_dir}/disk.img"
+expect_started
+expect_report '"code":0,"signal":null,"reason":"exited"'
+grep -a -q 'growing the root file system failed: ' "${case_dir}/serial.log" \
+    || fail "no line saying the growth failed"
+expect_absent serial.log 'grew the root file system'
+show_logs "${before}"
 
 # 10. Version 3 without init_system is version 2's run mode; init_system
 # is refused on a version-2 boot and with a user other than root.

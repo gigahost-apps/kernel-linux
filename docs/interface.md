@@ -173,7 +173,8 @@ These are the run mode's steps; the unpack mode's follow.
    system from <old> to <new> blocks`. It only ever grows, never shrinks;
    a file system that already fills its disk is left as it is. A failed
    growth is logged (`gigahost-init: growing the root file system failed:
-   <reason>`), leaves the file system as it was and the boot goes on, the
+   <reason>`), leaves a consistent file system (unchanged, or grown part of the
+   way, the rest grown at the next boot) and the boot goes on, the
    space unused. (Since release 6.18.57-gh4, for every interface version;
    the unpack mode grows nothing.)
 4. Mounts, as Docker does: devpts on `/dev/pts` (`newinstance`,
