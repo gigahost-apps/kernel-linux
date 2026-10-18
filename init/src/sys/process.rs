@@ -201,12 +201,14 @@ fn namespace_result(
     read_end: libc::c_int,
     gate: libc::c_int,
 ) -> Result<i32, SpawnError> {
-    let message = read_message(read_end);
-    // The first child exits once it has forked (or failed); reaping it
-    // makes the process this init's child, and its exit has taken it out
-    // of the cgroup: the image's init may go on.
+    // The first child exits once it has forked (or failed), its message
+    // already in the pipe; reaping it makes the process this init's child,
+    // and its exit has taken it out of the cgroup: the image's init may go
+    // on. Reaped before the read, so a first child killed before it wrote
+    // cannot leave the read waiting on a PID 1 that waits on the gate.
     reap(first);
     close(gate);
+    let message = read_message(read_end);
     let main = match message {
         Some([PID_TAG, a, b, c, d]) => i32::from_ne_bytes([a, b, c, d]),
         Some(message) => return Err(child_error(message)),
