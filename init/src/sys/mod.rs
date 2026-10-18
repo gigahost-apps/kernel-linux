@@ -5,6 +5,7 @@
 
 #[cfg(test)]
 pub mod alloc;
+pub mod disk;
 pub mod fs;
 pub mod mount;
 pub mod net;

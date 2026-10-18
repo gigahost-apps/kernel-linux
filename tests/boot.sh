@@ -491,6 +491,57 @@ boot reboot '{"version":1,"argv":["/bin/sh","-c","reboot -f"]}'
 expect_no_report
 show_logs "${before}"
 
+# 10a. A disk larger than its ext4 file system (a disk made or resized
+# larger than the image's): the init grows the file system online to the
+# disk's size before the process starts, which sees the space. A boot of
+# a disk the file system already fills (every other case, and the grown
+# disk again) changes nothing and logs nothing about it.
+root_kib_config=$(cat << 'JSON'
+{"version":1,"argv":["/bin/sh","-c","df -Pk / | awk 'NR == 2 { print \"ROOT_KIB=\" $2 }'"]}
+JSON
+)
+# root_kib: the root's size in KiB as the process saw it, 0 for none.
+root_kib() {
+    local line
+    line=$(tr -d '\r' < "${case_dir}/hvc.log" | grep -a -m 1 '^ROOT_KIB=[0-9]*$' || true)
+    line=${line#ROOT_KIB=}
+    echo "${line:-0}"
+}
+before=${failures}
+new_case grow "${root_kib_config}"
+cp --sparse=always "${work}/disk.img" "${case_dir}/disk.img"
+truncate -s 1G "${case_dir}/disk.img"
+qemu "${default_cmdline}" "${case_timeout}" "${case_dir}/disk.img"
+expect_started
+expect_report '"code":0,"signal":null,"reason":"exited"'
+grep -a -q -E '^gigahost-init: grew the root file system from [0-9]+ to [0-9]+ blocks$' "${case_dir}/serial.log" \
+    || fail "no line saying the root grew"
+expect_absent serial.log 'growing the root file system failed'
+grown_kib=$(root_kib)
+(( grown_kib > 900000 )) || fail "the grown root has ${grown_kib} KiB, expected more than 900000"
+mv "${case_dir}/disk.img" "${work}/grown.img"
+show_logs "${before}"
+before=${failures}
+new_case grown-again "${root_kib_config}"
+mv "${work}/grown.img" "${case_dir}/disk.img"
+qemu "${default_cmdline}" "${case_timeout}" "${case_dir}/disk.img"
+expect_report '"code":0,"signal":null,"reason":"exited"'
+expect_absent serial.log 'grew the root file system'
+expect_absent serial.log 'growing the root file system failed'
+[[ $(root_kib) == "${grown_kib}" ]] || fail "the root has $(root_kib) KiB on its second boot, ${grown_kib} on its first"
+rm -f "${case_dir}/disk.img"
+show_logs "${before}"
+before=${failures}
+new_case no-grow "${root_kib_config}"
+cp --sparse=always "${work}/disk.img" "${case_dir}/disk.img"
+qemu "${default_cmdline}" "${case_timeout}" "${case_dir}/disk.img"
+expect_report '"code":0,"signal":null,"reason":"exited"'
+expect_absent serial.log 'grew the root file system'
+expect_absent serial.log 'growing the root file system failed'
+kib=$(root_kib)
+(( kib > 200000 && kib < 270000 )) || fail "the root of a 256 MiB disk has ${kib} KiB"
+show_logs "${before}"
+
 # 10. Version 3 without init_system is version 2's run mode; init_system
 # is refused on a version-2 boot and with a user other than root.
 before=${failures}

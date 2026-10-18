@@ -6,6 +6,7 @@ use crate::cmdline::{self, KernelArgs};
 use crate::config::{self, Boot, Config};
 use crate::console::{self, fail, log};
 use crate::etc;
+use crate::grow;
 use crate::protocol::{self, Report};
 use crate::supervise;
 use crate::sys::{self, mount, net, process};
@@ -49,6 +50,7 @@ pub fn run() -> ! {
     };
     switch_root().unwrap_or_else(|error| fail(&error));
     console::set_on_disk();
+    grow::root(DISK);
     system_mounts().unwrap_or_else(|error| fail(&error));
     identity_files(&args).unwrap_or_else(|error| fail(&error));
     network(&args).unwrap_or_else(|error| fail(&format!("network setup failed: {error}")));

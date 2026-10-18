@@ -165,7 +165,17 @@ These are the run mode's steps; the unpack mode's follow.
 3. Waits up to 5 s for `/dev/vda` and mounts it (ext4) as the new root;
    moves `/dev`, `/proc` and `/sys` onto it; deletes the initramfs's files,
    so their memory is freed; moves the disk to `/` and chroots into it. The
-   init stays PID 1; the disk carries none of its files.
+   init stays PID 1; the disk carries none of its files. When the disk is
+   larger than its ext4 file system (a disk made larger than the image's
+   file system, or grown since), the init grows the file system online to
+   the disk's whole size (`EXT4_IOC_RESIZE_FS`, to the disk's size in whole
+   blocks of the file system) and logs `gigahost-init: grew the root file
+   system from <old> to <new> blocks`. It only ever grows, never shrinks;
+   a file system that already fills its disk is left as it is. A failed
+   growth is logged (`gigahost-init: growing the root file system failed:
+   <reason>`), leaves the file system as it was and the boot goes on, the
+   space unused. (Since release 6.18.57-gh4, for every interface version;
+   the unpack mode grows nothing.)
 4. Mounts, as Docker does: devpts on `/dev/pts` (`newinstance`,
    `ptmxmode=0666`, `mode=0620`, `gid=5`) with `/dev/pts/ptmx` bound over
    `/dev/ptmx`; tmpfs on `/dev/shm` (64 MiB, mode 1777); mqueue on

@@ -12,6 +12,7 @@ mod cmdline;
 mod config;
 mod console;
 mod etc;
+mod grow;
 mod protocol;
 mod setup;
 mod supervise;
