@@ -1,0 +1,15 @@
+# The systemd image of tests/boot.sh: Debian with systemd as /sbin/init,
+# cron and iproute2, and a unit that checks the boot once it is done. The
+# base is pinned by digest; the packages are Debian's current ones (they
+# only drive the checks).
+FROM docker.io/library/debian@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        systemd systemd-sysv cron iproute2 procps \
+ && rm -rf /var/lib/apt/lists/*
+COPY init-features.sh /usr/local/bin/init-features.sh
+COPY init-features.service /etc/systemd/system/init-features.service
+# cron's @reboot jobs run when cron starts: the proof it runs.
+RUN printf '@reboot root touch /run/cron-ran\n' > /etc/cron.d/init-features \
+ && chmod 0755 /usr/local/bin/init-features.sh \
+ && systemctl enable init-features.service cron.service

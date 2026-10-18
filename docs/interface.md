@@ -1,4 +1,4 @@
-# The host ↔ init interface, versions 1 and 2
+# The host ↔ init interface, versions 1, 2 and 3
 
 This is the contract between the host that boots a container machine (the
 agent) and `gigahost-init`, the init in this repository's initramfs. It is
@@ -6,7 +6,7 @@ written for agent authors: everything the agent writes and everything it
 reads back is here.
 
 A release's `build-info.json` lists the interface versions its init accepts
-(`"interface_versions": [1, 2]`). Any change to the kernel command line, the
+(`"interface_versions": [1, 2, 3]`). Any change to the kernel command line, the
 config or the vsock lines below is a new interface version.
 
 Version 2 is version 1 plus the unpack mode (below), in which the init
@@ -14,6 +14,13 @@ unpacks an image's layers onto an empty root disk, so the host never parses
 an image's archives. A boot names its version on the command line
 (`gh.v`); the config and every vsock line carry the same version. A
 version-1 boot behaves exactly as in version 1.
+
+Version 3 is version 2 plus `init_system` in the run mode (below): the
+config's `argv` is then the image's own init system (systemd, busybox
+init running OpenRC, `openrc-init`, ...), which the init runs as PID 1 of
+namespaces of its own, as container managers run an init system. A
+version-1 or version-2 boot behaves exactly as before; a version-3 boot
+without `init_system` is version 2's run mode.
 
 ## The machine
 
@@ -43,7 +50,9 @@ by default, can reboot or power the machine off itself; with the reset
 ending the domain, each of these ends it too, without an `exited` report.
 A halt by the process (`reboot(2)` with `RB_HALT_SYSTEM`) stops the
 CPUs without ending the domain; the agent's stop ends it then (see
-Trust). The domain's end is therefore the event the agent acts on; the
+Trust). With version 3's `init_system`, `reboot(2)` from the image ends
+only the image's PID namespace: the init reports it (`poweroff` or
+`reboot`) and powers the machine off (see The init system). The domain's end is therefore the event the agent acts on; the
 reports (below) say why it ended when the init could say so.
 
 ## Kernel command line
@@ -57,7 +66,7 @@ console=ttyS0 quiet gh.v=V gh.hostname=NAME gh.ip4=A.B.C.D/P gh.gw4=A.B.C.D
 
 | Key | Required | Value |
 |---|---|---|
-| `gh.v` | yes | The interface version, `1` or `2`. Any other value is refused. |
+| `gh.v` | yes | The interface version, `1`, `2` or `3`. Any other value is refused. |
 | `gh.hostname` | yes | The host name: dot-separated labels of letters, digits and hyphens (no label starting or ending with a hyphen), 64 bytes at most. |
 | `gh.ip4` | yes | `eth0`'s IPv4 address and prefix length, `A.B.C.D/P` (P 0–32). |
 | `gh.gw4` | yes | The IPv4 default gateway. A gateway outside `gh.ip4`'s prefix gets an on-link host route first. |
@@ -79,7 +88,7 @@ The fw_cfg entry `opt/gigahost/config`, read from
 object, at most 1 MiB (1,048,576 bytes).
 
 A config is of one of two modes. The **run mode** runs the image's
-process; it is all of version 1 and version 2's default:
+process; it is all of version 1 and the default of versions 2 and 3:
 
 ```json
 { "version": 1,
@@ -94,8 +103,8 @@ process; it is all of version 1 and version 2's default:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `version` | yes | The boot's `gh.v`: `1`, or `2`. Any other value is refused. |
-| `mode` | no | Version 2 only: `"run"` (the default). |
+| `version` | yes | The boot's `gh.v`: `1`, `2` or `3`. Any other value is refused. |
+| `mode` | no | Versions 2 and 3: `"run"` (the default). |
 | `argv` | yes | The process and its arguments, not empty. `argv[0]` is searched in the process's `PATH` unless it holds a `/`. The image's entrypoint and command, with the renter's overrides, already combined by the agent. |
 | `env` | no | `KEY=value` entries (a key is not empty). Default: none. |
 | `user` | no | Docker's `user[:group]`, by name or number. Default: root (uid 0, gid 0). |
@@ -103,11 +112,16 @@ process; it is all of version 1 and version 2's default:
 | `stop_timeout_seconds` | no | How long a stop waits for the process after the stop signal, 0–300. Default: 10. |
 | `stop_signal` | no | The signal a stop sends the process first, as a number, 1–64: the image's `STOPSIGNAL` (for example 3 for `SIGQUIT`). Default: 15 (`SIGTERM`). |
 | `authorized_keys` | no | SSH keys for the platform's stock images: `user` (a name, or a uid; a uid absent from the image's /etc/passwd has home `/`, so the keys go to `/.ssh/authorized_keys`) and `keys` (one key per entry, no line breaks). |
+| `init_system` | no | Version 3 only: `true` runs `argv` as the image's init system (see The init system), `false` (the default) as a process. With `true`, `argv[0]` must be an absolute path (`/sbin/init`, `/lib/systemd/systemd`, `/sbin/openrc-init`: the agent chooses), `user` absent or root (`root`, `0`, `0:0`, `root:root`, `root:0`, `0:root`) and `workdir` absent or `/`; anything else is refused. |
 
 Unknown fields are refused, at the top level and inside `authorized_keys`;
-a version-1 config has no `mode`. No string may hold a NUL byte.
+a version-1 config has no `mode`, and a version-1 or version-2 config no
+`init_system` (refused as an unknown field). No string may hold a NUL
+byte. A boot refuses a config of a later version than its own as one it
+does not support (as it did before that version existed), and one of an
+earlier version as not the boot's.
 
-The **unpack mode** (version 2) unpacks the image's layers onto the root
+The **unpack mode** (versions 2 and 3) unpacks the image's layers onto the root
 disk and runs nothing:
 
 ```json
@@ -121,7 +135,7 @@ disk and runs nothing:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `version` | yes | `2`, the boot's `gh.v`. |
+| `version` | yes | `2` or `3`, the boot's `gh.v`. |
 | `mode` | yes | `"unpack"`. |
 | `layers` | yes | The image's layers, lowest first, 1 to 128 of them, as the image's manifest lists them. Each: `media_type`, `digest` and `size`, nothing else. |
 | `layers[].media_type` | yes | `application/vnd.oci.image.layer.v1.tar`, `application/vnd.oci.image.layer.v1.tar+gzip`, `application/vnd.oci.image.layer.v1.tar+zstd` or `application/vnd.docker.image.rootfs.diff.tar.gzip`. Any other (a non-distributable or foreign layer among them) is refused. |
@@ -130,7 +144,8 @@ disk and runs nothing:
 
 A config is of one mode: an unpack config with any run field (`argv`,
 `env`, `user`, `workdir`, `stop_timeout_seconds`, `stop_signal`,
-`authorized_keys`) is refused, and so is a run config with `layers`.
+`authorized_keys`, and in version 3 `init_system`) is refused, and so is
+a run config with `layers`.
 
 The config may carry secrets. The init never writes an `env` value, a key
 or any other config value to the console or into a report; its error
@@ -192,6 +207,9 @@ These are the run mode's steps; the unpack mode's follow.
    The control port is bound before the process starts, so no process
    of the image can take it; the listener answers from the moment
    `started` is reported.
+
+   With version 3's `init_system`, step 8 starts the image's init system
+   instead, as The init system (below) describes.
 9. Reaps every process. When the main process ends, or on a stop command
    (below): SIGTERM to every other process, 2 s, SIGKILL to all; then the
    one `exited` report; sync; the root remounted read-only; power-off.
@@ -206,7 +224,120 @@ Any failure in these steps (an unknown version, a bad config, no disk, a
 user or `argv[0]` not found, a failed mount) ends in an `error` report and
 a power-off: the init never exits, which would panic the kernel.
 
-## The unpack mode (version 2)
+## The init system (version 3)
+
+With `"init_system": true` the init stays PID 1 of the machine (its
+reports, the control listener, the stop and the power-off are as for a
+process) and runs the image's init as PID 1 of a PID namespace of its
+own, the way systemd-nspawn, and Docker or Podman with a private cgroup
+namespace, run an init system. After steps 1–7, instead of step 8:
+
+1. **cgroups**: the init creates the cgroup `/sys/fs/cgroup/payload` and
+   enables every controller the kernel offers (`cgroup.controllers` of
+   the root) in the root's `cgroup.subtree_control`. The init stays in the
+   root cgroup, which cgroup v2's no-internal-process rule exempts; the
+   image's processes are all in `payload` and below it.
+2. **namespaces**: a first child moves into `payload`, unshares the PID,
+   mount and cgroup namespaces (so the cgroup namespace's root is
+   `payload`) and forks the image's init, which is PID 1 of the new PID
+   namespace, then exits: the image's init is the init's child, `payload`
+   holds no other process, and the init knows it by its PID in the
+   machine's namespace (the `pid` of `started`).
+3. **mounts**, inside the new mount namespace, which shares nothing back
+   (every mount private): a new `proc` on `/proc` (the namespace's
+   processes only); `/sys` read-only (as container managers mount it, so
+   the image's init leaves the devices alone: systemd starts no udev);
+   a new, writable cgroup2 on `/sys/fs/cgroup`, which shows the cgroup
+   namespace's root (`payload`, as `/`); and, with hvc0, `/dev/hvc0`
+   bound over `/dev/console`, so the image's init and what it starts on
+   the console write to hvc0 (systemd-nspawn binds a pseudo-terminal
+   there; a console device serves as well). The machine's own `/dev`,
+   `/run`, `/tmp`, `/dev/shm`, `/dev/pts` and the identity files are as
+   for a process.
+4. **capabilities**: `CAP_SYS_MODULE` is dropped from the bounding set:
+   the kernel loads no modules, and without the capability systemd skips
+   loading any (`ConditionCapability=CAP_SYS_MODULE`) instead of failing
+   to. Every other capability of root is kept.
+5. **the start**: root (uid 0, gid 0, root's supplementary groups), `/`
+   as the working directory, stdin `/dev/null`, stdout and stderr to hvc0
+   (or the serial console without it), every signal at its default
+   action, a new session, as for a process. The environment is that of a
+   process, with `container=gigahost` and `container_ttys=` (empty)
+   before the config's `env`, which may set either. systemd reads
+   `container` to know it runs in a container
+   (`systemd-detect-virt` says `container-other`); an empty
+   `container_ttys` starts no gettys but the console's. OpenRC knows only
+   its own container names (`container=lxc`, `rkt`, `systemd-nspawn`,
+   `docker`), so with `gigahost` it runs as on a virtual machine, which a
+   container machine is (the boot tests' Alpine image boots so); an image
+   or the agent may set `container`, or OpenRC's `rc_sys`, otherwise.
+6. **the end**: when the image's init ends, the kernel kills every other
+   process of its namespace; the init reports the end as below and powers
+   the machine off.
+
+The init's own terminal settings of hvc0 (raw) are the image's init's to
+change: systemd resets the console to a terminal's usual settings, which
+add `\r` before `\n`.
+
+### Stop
+
+A stop sends the config's `stop_signal` to the image's init, then, after
+the timeout, SIGTERM to every process, 2 s, and SIGKILL to every process
+(the image's init's SIGKILL ends its namespace). The agent sets the
+signal on which the image's init shuts down:
+
+| Init | `stop_signal` | What it does |
+|---|---|---|
+| systemd | 37 (`SIGRTMIN+3` with glibc, the C library systemd uses) | Starts `halt.target`: a clean shutdown, as systemd-nspawn and `docker stop` of a systemd container ask for it. |
+| busybox init (Alpine's `/sbin/init`, running OpenRC from `/etc/inittab`) | 12 (`SIGUSR2`) | Power-off: the `::shutdown:` entries (`openrc shutdown`), then every process killed. `SIGUSR1` halts, `SIGTERM` reboots. |
+| `openrc-init` | 15 (`SIGTERM`) | Halt: the `shutdown` runlevel, then every process killed. `SIGINT` reboots. |
+
+Whatever the image's init does then, the `exited` report says `stopped`.
+
+### Reasons
+
+The image's init ends as any process does, and the `exited` report says
+how:
+
+- `poweroff`: it powered off or halted (`systemctl poweroff`,
+  `systemctl halt`, busybox's `poweroff` and `halt`,
+  `openrc-shutdown -p` or `-H`). `reboot(2)` in a PID namespace other
+  than the machine's does not end the machine: the kernel kills the
+  namespace's init as if by SIGINT for a power-off or a halt, and by
+  SIGHUP for a reboot (`pid_namespaces(7)`), whichever process of the
+  namespace called it. systemd-nspawn reads the same statuses. `code` is
+  `null`, `signal` 2.
+- `reboot`: it rebooted (`systemctl reboot`, busybox's `reboot`,
+  `openrc-shutdown -r`): `code` `null`, `signal` 1. The init powers the
+  machine off as for any end; starting the instance again is the agent's
+  decision.
+- `exited`: it exited by itself, with `code` its status (systemd in a
+  container exits so for `systemctl exit N`), or was killed by another
+  signal (`signal`).
+- `stopped`, `error`: as for a process.
+
+The two reasons are reliable: nothing but `reboot(2)` in the namespace
+kills its init by SIGINT or SIGHUP. No process of the namespace can
+signal its init to death (the kernel drops a signal its init has no
+handler for), and the init sends it neither but as the stop signal, after
+which the report says `stopped`.
+
+### What the image's init may and may not do
+
+It may do anything root can in the machine but leave its namespaces: run
+services, mount (in its mount namespace), use and delegate the cgroups
+under `payload`, change sysctls (`/proc/sys` is writable, as on a
+virtual machine), set the host name and configure the network (the
+network namespace is the machine's; the init has configured `eth0`
+already). It does not see the init or the root cgroup, cannot end the
+machine but by ending its namespace (`reboot(2)` ends only the
+namespace; `/proc/sysrq-trigger` and a kernel panic are the machine's, as
+for a process), cannot load kernel modules (there are none) and does not
+manage devices (`/sys` is read-only). An image's init that expects
+virtual terminals (gettys on `tty1`…) finds none: images drop them
+(Alpine's `/etc/inittab` lines `tty1::respawn:...`, for example).
+
+## The unpack mode (versions 2 and 3)
 
 For a new container instance the agent:
 
@@ -218,13 +349,13 @@ For a new container instance the agent:
    no padding, so layer *i* starts at the sum of the sizes before it. The
    disk may be longer (a tail to a whole block); the bytes past the last
    layer are ignored;
-3. boots once with `gh.v=2`, the unpack config, the root disk as
+3. boots once with `gh.v=2` (or `3`), the unpack config, the root disk as
    `/dev/vda` and the layers disk as `/dev/vdb`, read-only (QEMU
    `readonly=on`, libvirt `<readonly/>`); the rest of the machine is as
    for a run boot;
 4. when the domain has ended and the last report is `unpacked`, detaches
    the layers disk and from then on boots the instance in the run mode
-   (version 1, or version 2 with `"mode": "run"`). Any other end (an
+   (version 1, or version 2 or 3 with `"mode": "run"`). Any other end (an
    `error` report, no report, a timeout of its own) leaves a disk that
    is not to be used: the agent starts again from step 1.
 
@@ -334,20 +465,27 @@ serial log for lines starting with `gigahost-init: report `).
 {"v":1,"event":"exited","code":null,"signal":15,"reason":"stopped"}
 {"v":1,"event":"exited","code":null,"signal":null,"reason":"error","message":"..."}
 {"v":2,"event":"exited","code":0,"signal":null,"reason":"unpacked"}
+{"v":3,"event":"exited","code":null,"signal":2,"reason":"poweroff"}
+{"v":3,"event":"exited","code":null,"signal":1,"reason":"reboot"}
 ```
 
-- `started`: the process is running; `pid` is its PID in the guest,
-  `monotonic_ms` the guest's monotonic clock at that moment.
+- `started`: the process is running; `pid` is its PID in the guest
+  (with `init_system`, the image's init's PID in the machine's PID
+  namespace; inside its own it is 1), `monotonic_ms` the guest's
+  monotonic clock at that moment.
 - `exited`, at most once per boot, and the last report when it comes
   (a panic, or a reboot or power-off by the process, ends the machine
-  without one):
+  without one; an init system's reboot or power-off is reported):
   - `code`: the exit status when the process exited, else `null`;
   - `signal`: the signal that killed it, else `null`;
   - `reason`: `exited` (it ended by itself), `stopped` (it ended after a
     stop command, whatever its status), `error` (the init could not
     start it, or in the unpack mode could not unpack the layers; `code`
-    and `signal` are `null`) or, in version 2's unpack mode, `unpacked`
-    (every layer is on the root disk; `code` 0);
+    and `signal` are `null`), in the unpack mode (versions 2 and 3)
+    `unpacked` (every layer is on the root disk; `code` 0) or, with
+    version 3's `init_system`, `poweroff` or `reboot` (the image's init
+    powered off, halted or rebooted; see The init system). An agent
+    takes a reason it does not know as an end of unknown cause;
   - `message`: with `error` only, what went wrong, in words that quote no
     config value.
 

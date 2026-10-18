@@ -1,0 +1,11 @@
+[Unit]
+Description=The boot test's checks
+After=multi-user.target cron.service
+
+[Service]
+# Not a oneshot: the boot must finish while it waits for it.
+Type=simple
+ExecStart=/usr/local/bin/init-features.sh systemd
+
+[Install]
+WantedBy=multi-user.target

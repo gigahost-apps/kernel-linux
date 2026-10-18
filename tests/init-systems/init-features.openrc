@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh disable=SC2034 # openrc-run reads these variables
+# The boot test's checks, in the background: they wait for the boot to
+# finish.
+description="The boot test's checks"
+command=/usr/local/bin/init-features.sh
+command_args=openrc
+command_background=yes
+pidfile=/run/init-features.pid
+
+depend() {
+    need crond
+}

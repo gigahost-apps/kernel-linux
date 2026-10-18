@@ -20,6 +20,7 @@ kernel=${release_dir}/bzImage
 initrd=${release_dir}/initramfs.cpio.zst
 case_timeout=30
 unpack_timeout=120
+init_system_timeout=60
 
 die() {
     echo "boot.sh: $*" >&2
@@ -144,6 +145,8 @@ layers_disk "${work}/layers.img" "${work}/unpack.json" "${image_layers[@]}" "${f
 network='gh.ip4=10.115.0.15/24 gh.gw4=10.115.0.1 gh.ip6=fd15:115::15/64 gh.gw6=fd15:115::1 gh.dns=10.115.0.3 gh.mtu=1500 gh.vsock=1024'
 default_cmdline="console=ttyS0 quiet gh.v=1 gh.hostname=case-host ${network}"
 v2_cmdline="console=ttyS0 quiet gh.v=2 gh.hostname=case-host ${network}"
+v3_cmdline="console=ttyS0 quiet gh.v=3 gh.hostname=case-host ${network}"
+unpack_cmdline=${v2_cmdline}
 
 failures=0
 case_dir=
@@ -215,7 +218,7 @@ unpack_boot() {
     else
         mkfs.ext4 -q -F -L root -E root_owner=0:0 "${case_dir}/disk.img" "${4:-256}M" > /dev/null
     fi
-    qemu "${v2_cmdline}" "${unpack_timeout}" "${case_dir}/disk.img" "$3" "${5:-256}"
+    qemu "${unpack_cmdline}" "${unpack_timeout}" "${case_dir}/disk.img" "$3" "${5:-256}"
 }
 
 # The one exited report on the serial console.
@@ -423,7 +426,7 @@ expect_absent serial.log '"event":"started"'
 expect_absent hvc.log ran
 show_logs "${before}"
 before=${failures}
-boot cmdline-v3 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "console=ttyS0 quiet gh.v=3 gh.hostname=case-host ${network}"
+boot cmdline-v4 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "console=ttyS0 quiet gh.v=4 gh.hostname=case-host ${network}"
 expect_report '"reason":"error","message":"gh.v names an interface version this init does not support"'
 expect_absent serial.log '"event":"started"'
 show_logs "${before}"
@@ -487,6 +490,114 @@ before=${failures}
 boot reboot '{"version":1,"argv":["/bin/sh","-c","reboot -f"]}'
 expect_no_report
 show_logs "${before}"
+
+# 10. Version 3 without init_system is version 2's run mode; init_system
+# is refused on a version-2 boot and with a user other than root.
+before=${failures}
+boot exit-3-v3 '{"version":3,"argv":["/bin/sh","-c","exit 3"]}' "${v3_cmdline}"
+expect_started 3
+expect_report '{"v":3,"event":"exited","code":3,"signal":null,"reason":"exited"}'
+show_logs "${before}"
+before=${failures}
+boot init-system-v2 '{"version":2,"argv":["/sbin/init"],"init_system":true}' "${v2_cmdline}"
+expect_report "\"reason\":\"error\",\"message\":\"the config has an unknown field \`init_system\`\""
+expect_absent serial.log '"event":"started"'
+show_logs "${before}"
+before=${failures}
+boot init-system-nobody '{"version":3,"argv":["/sbin/init"],"init_system":true,"user":"nobody"}' "${v3_cmdline}"
+expect_report "\"reason\":\"error\",\"message\":\"config field \`user\` is not root, which \`init_system\` requires\""
+expect_absent serial.log '"event":"started"'
+show_logs "${before}"
+
+# 11. Version 3's init_system: an image's own init system (systemd on
+# Debian, busybox init running OpenRC on Alpine) boots as PID 1 of its own
+# namespaces, its checks pass (tests/init-systems/init-features.sh), and it
+# powers the container off from inside, which the report says; a second
+# boot reboots from inside, which the report says too. The image is
+# unpacked by a version-3 unpack boot.
+init_systems=${repo}/tests/init-systems
+# init_system_disk NAME CONTAINERFILE: builds the image and unpacks it
+# onto ${work}/NAME.img.
+init_system_disk() {
+    local name=$1 containerfile=$2 tag layers before=${failures}
+    tag=$(cat "${init_systems}/${containerfile}" "${init_systems}"/init-features.* | sha256sum | cut -c1-64)
+    local image=localhost/kernel-linux-${name}:${tag}
+    if ! podman image exists "${image}"; then
+        echo "boot.sh: building ${image}"
+        podman build -q -t "${image}" -f "${init_systems}/${containerfile}" "${init_systems}" > /dev/null
+    fi
+    podman save -q --format oci-dir -o "${work}/${name}-oci" "${image}"
+    layers=$(python3 - "${work}/${name}-oci" << 'PYTHON'
+import json, sys
+oci = sys.argv[1]
+def blob(digest):
+    return f"{oci}/blobs/{digest.replace(':', '/')}"
+index = json.load(open(f"{oci}/index.json"))
+manifest = json.load(open(blob(index["manifests"][0]["digest"])))
+for layer in manifest["layers"]:
+    print(f"{blob(layer['digest'])}:{layer['mediaType']}")
+PYTHON
+    )
+    local image_layers=()
+    mapfile -t image_layers <<< "${layers}"
+    layers_disk "${work}/${name}-layers.img" "${work}/${name}-unpack.json" "${image_layers[@]}"
+    sed -i 's/^{"version": 2,/{"version": 3,/' "${work}/${name}-unpack.json"
+    rm -rf "${work}/${name}-oci"
+    unpack_cmdline=${v3_cmdline}
+    unpack_boot "${name}-unpack" "${work}/${name}-unpack.json" "${work}/${name}-layers.img" 1024
+    unpack_cmdline=${v2_cmdline}
+    expect_report '{"v":3,"event":"exited","code":0,"signal":null,"reason":"unpacked"}'
+    mv "${case_dir}/disk.img" "${work}/${name}.img"
+    rm -f "${work}/${name}-layers.img"
+    show_logs "${before}"
+}
+
+# init_system_boot NAME DISK CONFIG HOSTNAME: boots a copy of DISK with
+# CONFIG on a version-3 command line; the console's text, without the
+# carriage returns the image's init may set its terminal to add, lands in
+# $case_dir/console.txt.
+init_system_boot() {
+    new_case "$1" "$3"
+    cp --sparse=always "$2" "${case_dir}/disk.img"
+    qemu "${v3_cmdline/gh.hostname=case-host/gh.hostname=$4}" "${init_system_timeout}" "${case_dir}/disk.img"
+    tr -d '\r' < "${case_dir}/hvc.log" > "${case_dir}/console.txt"
+}
+
+# expect_init_features COUNT: COUNT passing checks and no failing one.
+expect_init_features() {
+    local passed
+    passed=$(grep -a -c '^FEATURE [a-z0-9_]* PASS$' "${case_dir}/console.txt" || true)
+    [[ ${passed} == "$1" ]] || fail "expected $1 passing init-system checks, got ${passed}"
+    expect_absent console.txt ' FAIL'
+    grep -a '^INFO ' "${case_dir}/console.txt" | sed 's/^/  /'
+}
+
+# init_system_cases NAME CONTAINERFILE STOP_SIGNAL CHECKS
+init_system_cases() {
+    local name=$1 before
+    init_system_disk "${name}" "$2"
+    local config='{"version":3,"argv":["/sbin/init"],"init_system":true,"stop_signal":'"$3"'}'
+    before=${failures}
+    init_system_boot "${name}-poweroff" "${work}/${name}.img" "${config}" poweroff-host
+    expect_started 3
+    expect_init_features "$4"
+    expect_line console.txt 'INFO action poweroff'
+    expect_report '{"v":3,"event":"exited","code":null,"signal":2,"reason":"poweroff"}'
+    show_logs "${before}"
+    before=${failures}
+    init_system_boot "${name}-reboot" "${work}/${name}.img" "${config}" reboot-host
+    expect_started 3
+    expect_init_features "$4"
+    expect_line console.txt 'INFO action reboot'
+    expect_report '{"v":3,"event":"exited","code":null,"signal":1,"reason":"reboot"}'
+    show_logs "${before}"
+    rm -f "${work}/${name}.img"
+}
+
+# systemd stops on SIGRTMIN+3 (37 with glibc), busybox init powers off on
+# SIGUSR2 (12).
+init_system_cases systemd Containerfile.debian 37 10
+init_system_cases openrc Containerfile.alpine 12 9
 
 if [[ ${failures} != 0 ]]; then
     echo "boot.sh: ${failures} check(s) failed"

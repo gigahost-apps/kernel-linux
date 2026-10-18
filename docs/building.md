@@ -11,7 +11,7 @@ A release is four files and their checksums, in `out/<RELEASE>/`:
 | `SHA256SUMS` | sha256 of the four files above. |
 
 The release name, `RELEASE`, is the kernel version, `-gh` and our build
-number (`6.18.57-gh2`); a release's tag is `v<RELEASE>`.
+number (`6.18.57-gh3`); a release's tag is `v<RELEASE>`.
 
 ## Build
 
@@ -108,12 +108,20 @@ the user, working directory and environment, the hosts, resolv.conf and
 host name (and that the disk's own files are untouched), refused configs
 and command lines, where the output goes, the SSH keys (which replace a
 symbolic link rather than write through it), the process's signal state,
-and that a kernel panic or a reboot by the process ends the machine. It
-needs `podman`, QEMU, `/dev/kvm`, `mkfs.ext4`, `debugfs`, `python3`,
-`gzip` and `zstd`. Each case must end with QEMU exiting by itself within
-30 s (an unpack within 120 s): the init's power-off,
-or for a panic or a reboot the reset, which `-no-reboot` turns into the
-end of QEMU.
+and that a kernel panic or a reboot by the process ends the machine; and
+version 3's init systems: two images built from `tests/init-systems/`
+(Debian with systemd, Alpine with busybox init running OpenRC), unpacked
+by a version-3 unpack boot, each booted twice, whose checks
+(`init-features.sh`: the image's init is PID 1 of its namespace, systemd
+reaches `running`, the journal and cron work, `/sys/fs/cgroup` is the
+namespace's and writable, `/sys` is read-only, the addresses are set)
+pass before the image's init powers off, and reboots, from inside, as
+the reports say. The cases print the boot time and the guest's
+`MemAvailable` at 256 MiB. It needs `podman`, QEMU, `/dev/kvm`,
+`mkfs.ext4`, `debugfs`, `python3`, `gzip` and `zstd`. Each case must end
+with QEMU exiting by itself within 30 s (an unpack within 120 s, an init
+system's boot within 60 s): the init's power-off, or for a panic or a
+reboot the reset, which `-no-reboot` turns into the end of QEMU.
 
 ## Where the kernel source comes from
 
