@@ -5,11 +5,22 @@ use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 // From `<linux/fs.h>` and `fs/ext4/ext4.h` (x86_64 encodings): not every
-// libc release carries them.
+// libc release carries them. The request's 32 bits, in the type the
+// target's libc gives `ioctl` (musl's `int`, glibc's `unsigned long`).
 /// `BLKGETSIZE64`: `_IOR(0x12, 114, size_t)`.
-const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    reason = "the request's bits, as the target's libc types them"
+)]
+const BLKGETSIZE64: libc::Ioctl = 0x8008_1272_u32 as libc::Ioctl;
 /// `EXT4_IOC_RESIZE_FS`: `_IOW('f', 16, __u64)`.
-const EXT4_IOC_RESIZE_FS: libc::c_ulong = 0x4008_6610;
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    reason = "the request's bits, as the target's libc types them"
+)]
+const EXT4_IOC_RESIZE_FS: libc::Ioctl = 0x4008_6610_u32 as libc::Ioctl;
 
 /// The size in bytes of the block device open as `fd`.
 pub fn block_device_bytes(fd: BorrowedFd<'_>) -> io::Result<u64> {
