@@ -385,8 +385,8 @@ pub fn run(config: &Unpack) -> ! {
 fn unpack(config: &Unpack) -> Result<(), String> {
     setup::wait_for(DISK)?;
     setup::wait_for(LAYERS)?;
-    // Read-only until it is known to be empty (or, in a redeploy, until
-    // it is cleared), so a disk refused here is left as it was.
+    // Read-only until it is known to be empty, so a disk refused here is
+    // left as it was; a redeploy takes the disk as it is.
     let flags = mount::NOSUID | mount::NODEV | mount::NOEXEC;
     mount::mount(
         Some(DISK),
