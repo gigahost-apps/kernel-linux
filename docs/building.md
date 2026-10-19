@@ -11,7 +11,7 @@ A release is four files and their checksums, in `out/<RELEASE>/`:
 | `SHA256SUMS` | sha256 of the four files above. |
 
 The release name, `RELEASE`, is the kernel version, `-gh` and our build
-number (`6.18.57-gh4`); a release's tag is `v<RELEASE>`.
+number (`6.18.57-gh5`); a release's tag is `v<RELEASE>`.
 
 ## Build
 

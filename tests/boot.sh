@@ -346,6 +346,114 @@ cmp -s "${case_dir}/big.out" "${work}/big/big" || fail "the unpacked 512 MiB fil
 rm -rf "${work}/big" "${case_dir}"
 show_logs "${before}"
 
+# U6–U10. Version 4's redeploy. Image A is the feature image with the
+# fixture and a layer of its own; image B is the feature image with
+# another, whose /data is opaque and has a /data/db/file of its own.
+v4_cmdline="console=ttyS0 quiet gh.v=4 gh.hostname=case-host ${network}"
+# unpack_config IN OUT VERSION [KEEP_JSON]: IN's unpack config in VERSION,
+# with "keep": KEEP_JSON when given.
+unpack_config() {
+    python3 - "$@" << 'PYTHON'
+import json, sys
+config = json.load(open(sys.argv[1]))
+config["version"] = int(sys.argv[3])
+if len(sys.argv) > 4:
+    config["keep"] = json.loads(sys.argv[4])
+json.dump(config, open(sys.argv[2], "w"))
+PYTHON
+}
+tar_layer "${work}/a.tar" \
+    "dir:data:0755" "file:data/db/file:0644:A" "file:etc/a-only:0644:a" \
+    "file:usr/bin/tool:0755:a-tool"
+tar_layer "${work}/b.tar" \
+    "file:data/.wh..wh..opq:0644:" "file:data/db/file:0644:B" "file:etc/b-only:0644:b" \
+    "file:usr/local/bin/b-process:0755:echo image-b; cat /data/db/file; echo; ls /etc/a-only /usr/bin/tool 2>&1 || true"
+layers_disk "${work}/a-layers.img" "${work}/a.json" "${image_layers[@]}" "${fixture}" \
+    "${work}/a.tar:application/vnd.oci.image.layer.v1.tar"
+layers_disk "${work}/b-layers.img" "${work}/b.json" "${image_layers[@]}" \
+    "${work}/b.tar:application/vnd.oci.image.layer.v1.tar"
+before=${failures}
+unpack_boot image-a "${work}/a.json" "${work}/a-layers.img"
+expect_report '"reason":"unpacked"'
+mv "${case_dir}/disk.img" "${work}/a.img"
+rm -f "${work}/a-layers.img"
+show_logs "${before}"
+
+# U6. A redeploy to image B keeping /data: /data is A's, everything else
+# B's; lost+found stays; a version-4 report.
+before=${failures}
+unpack_config "${work}/b.json" "${work}/b-keep.json" 4 '["/data"]'
+unpack_cmdline=${v4_cmdline}
+unpack_boot redeploy "${work}/b-keep.json" "${work}/b-layers.img" "" "" "${work}/a.img"
+unpack_cmdline=${v2_cmdline}
+expect_report '{"v":4,"event":"exited","code":0,"signal":null,"reason":"unpacked"}'
+grep -a -q 'gigahost-init: cleared the root disk but for the kept paths' "${case_dir}/serial.log" \
+    || fail "no line saying the root was cleared"
+grep -a -q -E "gigahost-init: layer ${#image_layers[@]}: 2 entries at kept paths skipped" "${case_dir}/serial.log" \
+    || fail "no line counting B's skipped entries"
+[[ $(debugfs -R 'cat /data/db/file' "${case_dir}/disk.img" 2> /dev/null) == A ]] \
+    || fail "/data/db/file is not A's"
+for gone in /etc/a-only /usr/bin/tool; do
+    debugfs -R "stat ${gone}" "${case_dir}/disk.img" 2>&1 | grep -q 'File not found' \
+        || fail "A's ${gone} survived the redeploy"
+done
+[[ $(debugfs -R 'cat /etc/b-only' "${case_dir}/disk.img" 2> /dev/null) == b ]] || fail "no /etc/b-only"
+debugfs_ls "${case_dir}/disk.img" /usr/bin | grep -q -x env || fail "B's /usr/bin is missing"
+debugfs_ls "${case_dir}/disk.img" / | grep -q -x lost+found || fail "lost+found is gone"
+mv "${case_dir}/disk.img" "${work}/redeployed.img"
+show_logs "${before}"
+
+# U7. The run boot after the redeploy starts B's process, on A's /data.
+before=${failures}
+new_case redeployed-run '{"version":4,"argv":["/bin/sh","/usr/local/bin/b-process"]}'
+mv "${work}/redeployed.img" "${case_dir}/disk.img"
+qemu "${v4_cmdline}" "${case_timeout}" "${case_dir}/disk.img"
+expect_started 4
+tr -d '\r' < "${case_dir}/hvc.log" > "${case_dir}/console.txt"
+expect_line console.txt image-b
+expect_line console.txt A
+expect_absent console.txt a-tool
+expect_report '{"v":4,"event":"exited","code":0,"signal":null,"reason":"exited"}'
+rm -f "${case_dir}/disk.img"
+show_logs "${before}"
+
+# U8. A redeploy keeping nothing replaces everything.
+before=${failures}
+unpack_config "${work}/b.json" "${work}/b-nothing.json" 4 '[]'
+unpack_cmdline=${v4_cmdline}
+unpack_boot redeploy-nothing "${work}/b-nothing.json" "${work}/b-layers.img" "" "" "${work}/a.img"
+unpack_cmdline=${v2_cmdline}
+expect_report '{"v":4,"event":"exited","code":0,"signal":null,"reason":"unpacked"}'
+[[ $(debugfs -R 'cat /data/db/file' "${case_dir}/disk.img" 2> /dev/null) == B ]] \
+    || fail "/data/db/file is not B's"
+debugfs -R 'stat /etc/a-only' "${case_dir}/disk.img" 2>&1 | grep -q 'File not found' \
+    || fail "A's /etc/a-only survived the redeploy"
+rm -f "${case_dir}/disk.img"
+show_logs "${before}"
+
+# U9. keep in a version-3 config: an unknown field, the disk unchanged.
+before=${failures}
+unpack_config "${work}/b.json" "${work}/b-keep-v3.json" 3 '["/data"]'
+unpack_cmdline=${v3_cmdline}
+unpack_boot keep-v3 "${work}/b-keep-v3.json" "${work}/b-layers.img" "" "" "${work}/a.img"
+unpack_cmdline=${v2_cmdline}
+expect_report "\"v\":3,\"event\":\"exited\",\"code\":null,\"signal\":null,\"reason\":\"error\",\"message\":\"the config has an unknown field \`keep\`\""
+cmp -s "${case_dir}/disk.img" "${work}/a.img" || fail "the disk changed"
+rm -f "${case_dir}/disk.img"
+show_logs "${before}"
+
+# U10. A version-4 unpack without keep still refuses a disk that is not
+# empty, unchanged.
+before=${failures}
+unpack_config "${work}/b.json" "${work}/b-v4.json" 4
+unpack_cmdline=${v4_cmdline}
+unpack_boot not-empty-v4 "${work}/b-v4.json" "${work}/b-layers.img" "" "" "${work}/a.img"
+unpack_cmdline=${v2_cmdline}
+expect_report '"v":4,"event":"exited","code":null,"signal":null,"reason":"error","message":"the root disk is not empty"'
+cmp -s "${case_dir}/disk.img" "${work}/a.img" || fail "the non-empty disk changed"
+rm -f "${case_dir}/disk.img" "${work}/a.img" "${work}/b-layers.img"
+show_logs "${before}"
+
 # 1. The kernel feature checks pass and the process exits 0.
 before=${failures}
 boot features '{"version":1,"argv":["/bin/sh","/usr/local/bin/features.sh"]}'
@@ -426,7 +534,7 @@ expect_absent serial.log '"event":"started"'
 expect_absent hvc.log ran
 show_logs "${before}"
 before=${failures}
-boot cmdline-v4 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "console=ttyS0 quiet gh.v=4 gh.hostname=case-host ${network}"
+boot cmdline-v5 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "console=ttyS0 quiet gh.v=5 gh.hostname=case-host ${network}"
 expect_report '"reason":"error","message":"gh.v names an interface version this init does not support"'
 expect_absent serial.log '"event":"started"'
 show_logs "${before}"
