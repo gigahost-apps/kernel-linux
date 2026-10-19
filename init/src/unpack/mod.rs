@@ -2,9 +2,12 @@
 //! layers, read from the read-only layers disk and checked by digest, are
 //! unpacked onto the empty root disk; then the machine powers off. The
 //! host never parses an archive: everything untrusted is read here, in
-//! the guest.
+//! the guest. From version 4 an unpack with `keep` is a redeploy: the
+//! root disk is cleared but for the kept paths ([`keep`]), which no layer
+//! changes.
 
 pub mod apply;
+pub mod keep;
 pub mod tar;
 #[cfg(test)]
 mod tests;
@@ -15,9 +18,11 @@ use crate::protocol::Report;
 use crate::setup::{self, DISK, NEWROOT};
 use crate::sys::{self, mount};
 use apply::Tree;
+use keep::Keep;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::FileExt;
 
 /// The layers disk: the blobs one after the other, in the config's order.
@@ -49,6 +54,9 @@ pub enum Failure {
     Unsupported(&'static str),
     /// A file system step failed.
     Apply(&'static str, io::Error),
+    /// The entry is at or inside a kept path of a redeploy: it is
+    /// skipped, never reported.
+    Kept,
 }
 
 /// Marks a stream error with where it arose.
@@ -107,6 +115,7 @@ impl Failure {
                 "the root disk is full".into()
             }
             Failure::Apply(what, error) => format!("{what} failed: {error}"),
+            Failure::Kept => "an entry is at a kept path".into(),
         }
     }
 }
@@ -336,6 +345,28 @@ fn expansion_limit() -> u64 {
         .saturating_add(1 << 30)
 }
 
+/// A redeploy's first step: finds the kept paths and removes everything
+/// else on the root. A failure is reported as one kind, its cause logged
+/// (it names no path); the agent rolls the disk back.
+pub fn clear_root(root: BorrowedFd<'_>, paths: &[Vec<u8>]) -> Result<Keep, String> {
+    let failed = |failure: Failure| {
+        log(&format!(
+            "clearing the root: {}",
+            failure.message(Compression::None)
+        ));
+        String::from("clearing the root failed")
+    };
+    let (keep, missing) = Keep::resolve(root, paths).map_err(failed)?;
+    for index in missing {
+        log(&format!(
+            "kept path {index} does not exist on the root disk: not kept"
+        ));
+    }
+    keep.clear(root).map_err(failed)?;
+    log("cleared the root disk but for the kept paths");
+    Ok(keep)
+}
+
 /// The unpack mode's steps 2 to 5: never returns.
 pub fn run(config: &Unpack) -> ! {
     match unpack(config) {
@@ -354,8 +385,8 @@ pub fn run(config: &Unpack) -> ! {
 fn unpack(config: &Unpack) -> Result<(), String> {
     setup::wait_for(DISK)?;
     setup::wait_for(LAYERS)?;
-    // Read-only until it is known to be empty, so a disk refused here is
-    // left as it was.
+    // Read-only until it is known to be empty (or, in a redeploy, until
+    // it is cleared), so a disk refused here is left as it was.
     let flags = mount::NOSUID | mount::NODEV | mount::NOEXEC;
     mount::mount(
         Some(DISK),
@@ -365,12 +396,14 @@ fn unpack(config: &Unpack) -> Result<(), String> {
         None,
     )
     .map_err(|error| format!("mounting the root disk failed: {error}"))?;
-    let entries = std::fs::read_dir(NEWROOT)
-        .map_err(|error| format!("reading the root disk failed: {error}"))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("reading the root disk failed: {error}"))?;
-        if entry.file_name() != "lost+found" {
-            return Err("the root disk is not empty".into());
+    if config.keep.is_none() {
+        let entries = std::fs::read_dir(NEWROOT)
+            .map_err(|error| format!("reading the root disk failed: {error}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("reading the root disk failed: {error}"))?;
+            if entry.file_name() != "lost+found" {
+                return Err("the root disk is not empty".into());
+            }
         }
     }
     mount::mount(None, NEWROOT, None, flags | mount::REMOUNT, None)
@@ -379,13 +412,26 @@ fn unpack(config: &Unpack) -> Result<(), String> {
         .map_err(|error| format!("opening the layers disk failed: {error}"))?;
     let root = std::fs::File::open(NEWROOT)
         .map_err(|error| format!("opening the root disk failed: {error}"))?;
-    let mut tree = Tree::new(root.into());
+    let mut tree = match &config.keep {
+        None => Tree::new(root.into()),
+        Some(paths) => {
+            let keep = clear_root(root.as_fd(), paths)?;
+            Tree::with_keep(root.into(), keep)
+        }
+    };
     let limit = expansion_limit();
     let mut offset: u64 = 0;
     for (index, layer) in config.layers.iter().enumerate() {
         unpack_layer(&disk, offset, layer, &mut tree, limit)
             .map_err(|problem| format!("layer {index}: {problem}"))?;
         log(&format!("unpacked layer {index}"));
+        if tree.skipped > 0 {
+            log(&format!(
+                "layer {index}: {} entries at kept paths skipped",
+                tree.skipped
+            ));
+            tree.skipped = 0;
+        }
         offset = offset.saturating_add(layer.size);
     }
     if tree.dropped_xattrs > 0 {

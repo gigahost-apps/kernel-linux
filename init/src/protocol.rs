@@ -1,5 +1,5 @@
-//! The JSON lines between the init and the host (interface versions 1, 2
-//! and 3): the reports the init sends, the commands it accepts and its
+//! The JSON lines between the init and the host (interface versions 1 to
+//! 4): the reports the init sends, the commands it accepts and its
 //! answers.
 
 use crate::config::MAX_STOP_TIMEOUT_SECONDS;
@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The interface versions whose lines this init speaks.
-pub const VERSIONS: &[u32] = &[1, 2, 3];
+pub const VERSIONS: &[u32] = &[1, 2, 3, 4];
 
 /// The boot's interface version (`gh.v`), which every line carries as
 /// `v`; 1 until the command line names a supported one.
@@ -332,6 +332,29 @@ mod tests {
             decode_command(r#"{"v":2,"command":"stop"}"#, 3),
             Err("unsupported interface version")
         );
+    }
+
+    #[test]
+    fn version_four_lines() {
+        let report = Report {
+            v: 4,
+            ..Report::unpacked()
+        };
+        assert_eq!(
+            report.encode(),
+            r#"{"v":4,"event":"exited","code":0,"signal":null,"reason":"unpacked"}"#
+        );
+        assert_eq!(
+            decode_command(r#"{"v":4,"command":"stop"}"#, 4),
+            Ok(Command::Stop {
+                timeout_seconds: None
+            })
+        );
+        assert_eq!(
+            decode_command(r#"{"v":3,"command":"stop"}"#, 4),
+            Err("unsupported interface version")
+        );
+        assert_eq!(encode_answer(Ok(()), 4), r#"{"v":4,"ok":true}"#);
     }
 
     #[test]

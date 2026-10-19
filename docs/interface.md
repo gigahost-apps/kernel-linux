@@ -1,4 +1,4 @@
-# The host ↔ init interface, versions 1, 2 and 3
+# The host ↔ init interface, versions 1 to 4
 
 This is the contract between the host that boots a container machine (the
 agent) and `gigahost-init`, the init in this repository's initramfs. It is
@@ -6,7 +6,7 @@ written for agent authors: everything the agent writes and everything it
 reads back is here.
 
 A release's `build-info.json` lists the interface versions its init accepts
-(`"interface_versions": [1, 2, 3]`). Any change to the kernel command line, the
+(`"interface_versions": [1, 2, 3, 4]`). Any change to the kernel command line, the
 config or the vsock lines below is a new interface version.
 
 Version 2 is version 1 plus the unpack mode (below), in which the init
@@ -21,6 +21,12 @@ init running OpenRC, `openrc-init`, ...), which the init runs as PID 1 of
 namespaces of its own, as container managers run an init system. A
 version-1 or version-2 boot behaves exactly as before; a version-3 boot
 without `init_system` is version 2's run mode.
+
+Version 4 is version 3 plus `keep` in the unpack mode (below): with it,
+the unpack is a redeploy, which moves an instance to another image on
+the same root disk, keeping the paths `keep` names (its volumes) and
+removing everything else. A boot of an earlier version behaves exactly
+as before; a version-4 boot is version 3's in everything else.
 
 ## The machine
 
@@ -66,7 +72,7 @@ console=ttyS0 quiet gh.v=V gh.hostname=NAME gh.ip4=A.B.C.D/P gh.gw4=A.B.C.D
 
 | Key | Required | Value |
 |---|---|---|
-| `gh.v` | yes | The interface version, `1`, `2` or `3`. Any other value is refused. |
+| `gh.v` | yes | The interface version, `1`, `2`, `3` or `4`. Any other value is refused. |
 | `gh.hostname` | yes | The host name: dot-separated labels of letters, digits and hyphens (no label starting or ending with a hyphen), 64 bytes at most. |
 | `gh.ip4` | yes | `eth0`'s IPv4 address and prefix length, `A.B.C.D/P` (P 0–32). |
 | `gh.gw4` | yes | The IPv4 default gateway. A gateway outside `gh.ip4`'s prefix gets an on-link host route first. |
@@ -88,7 +94,7 @@ The fw_cfg entry `opt/gigahost/config`, read from
 object, at most 1 MiB (1,048,576 bytes).
 
 A config is of one of two modes. The **run mode** runs the image's
-process; it is all of version 1 and the default of versions 2 and 3:
+process; it is all of version 1 and the default of versions 2 to 4:
 
 ```json
 { "version": 1,
@@ -103,8 +109,8 @@ process; it is all of version 1 and the default of versions 2 and 3:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `version` | yes | The boot's `gh.v`: `1`, `2` or `3`. Any other value is refused. |
-| `mode` | no | Versions 2 and 3: `"run"` (the default). |
+| `version` | yes | The boot's `gh.v`: `1`, `2`, `3` or `4`. Any other value is refused. |
+| `mode` | no | Versions 2 to 4: `"run"` (the default). |
 | `argv` | yes | The process and its arguments, not empty. `argv[0]` is searched in the process's `PATH` unless it holds a `/`. The image's entrypoint and command, with the renter's overrides, already combined by the agent. |
 | `env` | no | `KEY=value` entries (a key is not empty). Default: none. |
 | `user` | no | Docker's `user[:group]`, by name or number. Default: root (uid 0, gid 0). |
@@ -121,7 +127,7 @@ byte. A boot refuses a config of a later version than its own as one it
 does not support (as it did before that version existed), and one of an
 earlier version as not the boot's.
 
-The **unpack mode** (versions 2 and 3) unpacks the image's layers onto the root
+The **unpack mode** (versions 2 to 4) unpacks the image's layers onto the root
 disk and runs nothing:
 
 ```json
@@ -135,17 +141,19 @@ disk and runs nothing:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `version` | yes | `2` or `3`, the boot's `gh.v`. |
+| `version` | yes | `2`, `3` or `4`, the boot's `gh.v`. |
 | `mode` | yes | `"unpack"`. |
 | `layers` | yes | The image's layers, lowest first, 1 to 128 of them, as the image's manifest lists them. Each: `media_type`, `digest` and `size`, nothing else. |
 | `layers[].media_type` | yes | `application/vnd.oci.image.layer.v1.tar`, `application/vnd.oci.image.layer.v1.tar+gzip`, `application/vnd.oci.image.layer.v1.tar+zstd` or `application/vnd.docker.image.rootfs.diff.tar.gzip`. Any other (a non-distributable or foreign layer among them) is refused. |
 | `layers[].digest` | yes | The blob's digest: `sha256:` and 64 lowercase hex digits. |
 | `layers[].size` | yes | The blob's length in bytes, at least 1. |
+| `keep` | no | Version 4 only: present (even empty), the unpack is a redeploy (see The redeploy). The paths of the root disk to keep, 0 to 64 of them: each absolute and normalised (no `.`, `..` or empty component, no trailing `/`), at most 4095 bytes, not `/` itself, none given twice. |
 
 A config is of one mode: an unpack config with any run field (`argv`,
 `env`, `user`, `workdir`, `stop_timeout_seconds`, `stop_signal`,
 `authorized_keys`, and in version 3 `init_system`) is refused, and so is
-a run config with `layers`.
+a run config with `layers` (or `keep`, in any version: it is an unknown
+field there, as it is in an unpack config before version 4).
 
 The config may carry secrets. The init never writes an `env` value, a key
 or any other config value to the console or into a report; its error
@@ -357,7 +365,7 @@ manage devices (`/sys` is read-only). An image's init that expects
 virtual terminals (gettys on `tty1`…) finds none: images drop them
 (Alpine's `/etc/inittab` lines `tty1::respawn:...`, for example).
 
-## The unpack mode (versions 2 and 3)
+## The unpack mode (versions 2 to 4)
 
 For a new container instance the agent:
 
@@ -369,13 +377,13 @@ For a new container instance the agent:
    no padding, so layer *i* starts at the sum of the sizes before it. The
    disk may be longer (a tail to a whole block); the bytes past the last
    layer are ignored;
-3. boots once with `gh.v=2` (or `3`), the unpack config, the root disk as
+3. boots once with `gh.v=2` (or `3`, `4`), the unpack config, the root disk as
    `/dev/vda` and the layers disk as `/dev/vdb`, read-only (QEMU
    `readonly=on`, libvirt `<readonly/>`); the rest of the machine is as
    for a run boot;
 4. when the domain has ended and the last report is `unpacked`, detaches
    the layers disk and from then on boots the instance in the run mode
-   (version 1, or version 2 or 3 with `"mode": "run"`). Any other end (an
+   (version 1, or version 2, 3 or 4 with `"mode": "run"`). Any other end (an
    `error` report, no report, a timeout of its own) leaves a disk that
    is not to be used: the agent starts again from step 1.
 
@@ -386,7 +394,9 @@ In the unpack mode the init:
 2. waits up to 5 s for each of `/dev/vda` and `/dev/vdb`, mounts
    `/dev/vda` (ext4) read-only and refuses it, unchanged, unless it is
    empty but for `lost+found` (`the root disk is not empty`); then
-   remounts it read-write;
+   remounts it read-write. A redeploy (a config with `keep`) takes a disk
+   that is not empty, and clears it before the first layer (see The
+   redeploy);
 3. for each layer in order: reads exactly `size` bytes from its offset of
    the layers disk, hashing them with SHA-256 as it streams them,
    decompresses them as the media type says and applies the tar stream to
@@ -415,6 +425,50 @@ failure, never what the archive holds:
 - `layer N: an extended attribute does not fit` (larger than the file
   system keeps for one file)
 - `layer N: it expands to more than the root disk can hold`
+- `clearing the root failed` (a redeploy only; see The redeploy)
+
+### The redeploy (version 4)
+
+A redeploy moves an instance to another image on its own root disk,
+keeping its volumes. The agent boots the unpack mode as above, with the
+instance's root disk (not a new, empty one) and `keep` in the config;
+it snapshots the disk first, and rolls it back from the snapshot on any
+end but `unpacked`: the init does not undo a failed redeploy itself.
+
+Before the first layer the init:
+
+1. finds each kept path inside the root disk as it resolves every path
+   (`openat2` with `RESOLVE_IN_ROOT`), its last component never followed:
+   a kept symbolic link is kept as the link itself, not what it points
+   to, and a path through a symbolic link keeps what it resolves to, at
+   the place it resolves to (the links on the way are not kept). A kept
+   path that does not exist is logged (by its index in `keep`) and not
+   kept: the new image's own entries are unpacked there;
+2. removes everything on the root disk but the kept paths, each a whole
+   tree, the directories they are in (each directory itself, with its
+   owner and mode as on the disk: its other entries are removed) and
+   the root's `lost+found`. **Every other file of the disk is removed**:
+   the renter's data outside the kept paths does not survive a redeploy.
+   A failure here is `clearing the root failed`, its cause logged on the
+   serial console.
+
+Then the layers are applied by the rules below, but nothing at or inside
+a kept path is created, replaced, changed or removed: an entry there of
+any kind (a whiteout and an opaque marker too) is skipped, and the init
+logs how many entries of each layer it skipped. The check is made where
+an entry's path resolves on the disk, not on its name alone, so no route
+through a symbolic link (the layer's or the disk's) or a hard link
+reaches into a kept tree. A directory a kept path is in stays a
+directory: an entry of another kind there is skipped, a directory entry
+there gives it the new image's owner, mode, attributes and time, a
+whiteout of it or an opaque directory above it removes the rest of what
+is in it and keeps the kept path. A hard link to a kept file is skipped
+too.
+
+`keep: []` is a redeploy that keeps nothing: the disk is cleared but for
+`lost+found`, then unpacked as a new one. The removal has the bounds of
+the layers' (a tree at most 512 directories deep, a name at a time); the
+report is `unpacked` as for any unpack, with the boot's `v` (4).
 
 ### The layer rules
 
@@ -501,7 +555,7 @@ serial log for lines starting with `gigahost-init: report `).
   - `reason`: `exited` (it ended by itself), `stopped` (it ended after a
     stop command, whatever its status), `error` (the init could not
     start it, or in the unpack mode could not unpack the layers; `code`
-    and `signal` are `null`), in the unpack mode (versions 2 and 3)
+    and `signal` are `null`), in the unpack mode (versions 2 to 4)
     `unpacked` (every layer is on the root disk; `code` 0) or, with
     version 3's `init_system`, `poweroff` or `reboot` (the image's init
     powered off, halted or rebooted; see The init system). An agent

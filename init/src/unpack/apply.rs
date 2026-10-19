@@ -6,8 +6,13 @@
 //! (so `..` and absolute symbolic links stay inside, as they do for the
 //! container later), and the entry itself is made with an `*at` call on
 //! that parent and one plain name, never following a symbolic link.
+//!
+//! In a redeploy (interface version 4) nothing at or inside a kept path
+//! changes: an entry there is skipped and counted, whatever its kind, and
+//! whatever route its path takes ([`super::keep`]).
 
 use super::Failure;
+use super::keep::{Keep, Place};
 use super::tar::{Data, Entry, Kind};
 use crate::sys::fs::{self, Stat};
 use sha2::{Digest, Sha256};
@@ -21,7 +26,7 @@ const MAX_PATH: usize = 4096;
 
 /// How deep a removed or emptied tree may be: one directory descriptor is
 /// open per level, and PID 1's soft limit is 1024 descriptors.
-const MAX_DEPTH: usize = 512;
+pub const MAX_DEPTH: usize = 512;
 
 /// The most paths one layer may name: its entries' and their parent
 /// directories', a path through a symbolic link counted as a path of its
@@ -57,6 +62,11 @@ pub struct Tree {
     /// Extended attributes the file system refused (not supported, or not
     /// allowed on that kind of file), as container runtimes skip them.
     pub dropped_xattrs: u64,
+    /// A redeploy's kept paths, when any was found.
+    keep: Option<Keep>,
+    /// The entries skipped as at or inside a kept path, since the caller
+    /// last set it to 0.
+    pub skipped: u64,
 }
 
 fn step(what: &'static str) -> impl Fn(io::Error) -> Failure {
@@ -67,7 +77,7 @@ fn is(error: &io::Error, code: libc::c_int) -> bool {
     error.raw_os_error() == Some(code)
 }
 
-fn c_name(bytes: &[u8]) -> Result<CString, Failure> {
+pub fn c_name(bytes: &[u8]) -> Result<CString, Failure> {
     CString::new(bytes).map_err(|_| Failure::Archive("a path holds a NUL byte"))
 }
 
@@ -95,7 +105,7 @@ pub fn clean(path: &[u8]) -> Result<Vec<u8>, Failure> {
 }
 
 /// The parent and the last name of a cleaned, non-empty path.
-fn split(path: &[u8]) -> (&[u8], &[u8]) {
+pub fn split(path: &[u8]) -> (&[u8], &[u8]) {
     match path.iter().rposition(|&byte| byte == b'/') {
         Some(slash) => (
             path.get(..slash).unwrap_or_default(),
@@ -105,7 +115,7 @@ fn split(path: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-fn join(parent: &[u8], name: &[u8]) -> Vec<u8> {
+pub fn join(parent: &[u8], name: &[u8]) -> Vec<u8> {
     if parent.is_empty() {
         name.to_vec()
     } else {
@@ -120,7 +130,7 @@ fn key(path: &[u8]) -> [u8; 16] {
     key
 }
 
-fn stat(dir: BorrowedFd<'_>, name: &CStr) -> Result<Option<Stat>, Failure> {
+pub fn stat(dir: BorrowedFd<'_>, name: &CStr) -> Result<Option<Stat>, Failure> {
     match fs::stat_at(dir, name) {
         Ok(stat) => Ok(Some(stat)),
         Err(error) if is(&error, libc::ENOENT) => Ok(None),
@@ -130,10 +140,16 @@ fn stat(dir: BorrowedFd<'_>, name: &CStr) -> Result<Option<Stat>, Failure> {
 
 /// Removes `name` from `dir`, a directory with everything in it.
 fn remove(dir: BorrowedFd<'_>, name: &CStr) -> Result<(), Failure> {
+    remove_below(dir, name, 0)
+}
+
+/// As [`remove`], with `dir` itself `depth` directories deep in a tree
+/// being removed or emptied.
+pub fn remove_below(dir: BorrowedFd<'_>, name: &CStr, depth: usize) -> Result<(), Failure> {
     match stat(dir, name)? {
         None => Ok(()),
         Some(found) if found.is_dir() => {
-            remove_contents(dir, name, 0)?;
+            remove_contents(dir, name, depth)?;
             fs::unlink_at(dir, name, true).map_err(step("removing a directory"))
         }
         Some(_) => fs::unlink_at(dir, name, false).map_err(step("removing a file")),
@@ -182,6 +198,42 @@ impl Tree {
             deferred: Vec::new(),
             deferred_bytes: 0,
             dropped_xattrs: 0,
+            keep: None,
+            skipped: 0,
+        }
+    }
+
+    /// A redeploy's tree: nothing at or inside a path of `keep` changes.
+    pub fn with_keep(root: OwnedFd, keep: Keep) -> Self {
+        Tree {
+            keep: (!keep.is_empty()).then_some(keep),
+            ..Tree::new(root)
+        }
+    }
+
+    /// Refuses, as [`Failure::Kept`], a change at the cleaned `path` that
+    /// an entry names when a kept path is it or holds it.
+    fn check_named(&self, path: &[u8]) -> Result<(), Failure> {
+        match &self.keep {
+            Some(keep) if keep.named(path) == Place::Kept => Err(Failure::Kept),
+            _ => Ok(()),
+        }
+    }
+
+    /// Where `name` in `dir` is on the disk against the kept paths.
+    fn real_place(&self, dir: BorrowedFd<'_>, name: &[u8]) -> Result<Place, Failure> {
+        match &self.keep {
+            Some(keep) => keep.real_place(dir, name),
+            None => Ok(Place::Free),
+        }
+    }
+
+    /// Where the open directory `dir` is on the disk against the kept
+    /// paths.
+    fn dir_place(&self, dir: BorrowedFd<'_>) -> Result<Place, Failure> {
+        match &self.keep {
+            Some(keep) => keep.dir_place(dir),
+            None => Ok(Place::Free),
         }
     }
 
@@ -218,6 +270,10 @@ impl Tree {
                 )
             };
             if let Ok(dir) = opened {
+                // A later entry may have put a symbolic link on its path.
+                if self.dir_place(dir.as_fd())? == Place::Kept {
+                    continue;
+                }
                 fs::set_times_fd(dir.as_fd(), *seconds, *nanoseconds)
                     .map_err(step("setting a directory's times"))?;
             }
@@ -268,7 +324,12 @@ impl Tree {
         }
         let flags = libc::O_RDONLY | libc::O_DIRECTORY;
         match fs::open_inside(self.root.as_fd(), &c_name(parent)?, flags) {
-            Ok(dir) => return Ok(Some(dir)),
+            Ok(dir) => {
+                if self.dir_place(dir.as_fd())? == Place::Kept {
+                    return Err(Failure::Kept);
+                }
+                return Ok(Some(dir));
+            }
             Err(error) if is(&error, libc::ENOENT) && create => {}
             Err(error) if is(&error, libc::ENOENT) || is(&error, libc::ENOTDIR) => {
                 return if create {
@@ -288,6 +349,10 @@ impl Tree {
             current = match fs::open_inside(self.root.as_fd(), &path, flags) {
                 Ok(dir) => dir,
                 Err(error) if is(&error, libc::ENOENT) => {
+                    self.check_named(&prefix)?;
+                    if self.real_place(current.as_fd(), part)? == Place::Kept {
+                        return Err(Failure::Kept);
+                    }
                     let name = c_name(part)?;
                     match fs::mkdir_at(current.as_fd(), &name, 0o755) {
                         Ok(()) => {}
@@ -308,11 +373,29 @@ impl Tree {
                 Err(error) => return Err(Failure::Apply("resolving a path", error)),
             };
         }
+        if self.dir_place(current.as_fd())? == Place::Kept {
+            return Err(Failure::Kept);
+        }
         Ok(Some(current))
     }
 
-    /// Applies one entry; its file data is read from `data`.
+    /// Applies one entry; its file data is read from `data`. An entry at
+    /// or inside a kept path is skipped and counted in [`Tree::skipped`].
     pub fn apply<R: Read>(&mut self, entry: &Entry, data: &mut Data<'_, R>) -> Result<(), Failure> {
+        match self.apply_entry(entry, data) {
+            Err(Failure::Kept) => {
+                self.skipped += 1;
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    fn apply_entry<R: Read>(
+        &mut self,
+        entry: &Entry,
+        data: &mut Data<'_, R>,
+    ) -> Result<(), Failure> {
         let path = clean(&entry.path)?;
         if path.is_empty() {
             return if entry.kind == Kind::Directory {
@@ -328,9 +411,17 @@ impl Tree {
         if let Some(target) = name.strip_prefix(WHITEOUT) {
             return self.whiteout(parent, name, target);
         }
+        self.check_named(&path)?;
         let Some(dir) = self.open_dir(parent, true)? else {
             return Err(Failure::Archive("a path's parent is not a directory"));
         };
+        // A directory a kept path is in stays one: only a directory entry
+        // (its owner, mode, attributes and times) applies to it.
+        match self.real_place(dir.as_fd(), name)? {
+            Place::Kept => return Err(Failure::Kept),
+            Place::Ancestor if entry.kind != Kind::Directory => return Err(Failure::Kept),
+            _ => {}
+        }
         let c = c_name(name)?;
         match &entry.kind {
             Kind::Directory => self.directory(&dir, &c, entry, &path)?,
@@ -385,9 +476,11 @@ impl Tree {
 
     /// `.wh.<name>` removes `<name>` as the lower layers left it;
     /// `.wh..wh..opq` empties its directory of the lower layers' entries.
-    /// Neither is created.
+    /// Neither is created. Neither changes a kept path, and a directory a
+    /// kept path is in is emptied of the rest, never removed.
     fn whiteout(&mut self, parent: &[u8], name: &[u8], target: &[u8]) -> Result<(), Failure> {
         if name == OPAQUE {
+            self.check_named(parent)?;
             let Some(dir) = self.open_dir(parent, true)? else {
                 return Err(Failure::Archive("a path's parent is not a directory"));
             };
@@ -404,18 +497,24 @@ impl Tree {
         if target.is_empty() || target == b"." || target == b".." {
             return Err(Failure::Archive("a whiteout names nothing"));
         }
+        let target_path = join(parent, target);
+        self.check_named(&target_path)?;
         let Some(dir) = self.open_dir(parent, false)? else {
             return Ok(());
         };
         let c = c_name(target)?;
-        let target_path = join(parent, target);
-        if !self.was_seen(&target_path) {
+        let place = self.real_place(dir.as_fd(), target)?;
+        if place == Place::Kept {
+            return Err(Failure::Kept);
+        }
+        if place == Place::Free && !self.was_seen(&target_path) {
             return remove(dir.as_fd(), &c);
         }
         // This layer's own entry stays: a whiteout hides lower layers
         // only. A directory of this layer may hold the lower layers'
         // entries too (it merged into theirs): those go, as from an
-        // opaque directory.
+        // opaque directory. So do those of a directory a kept path is in,
+        // the kept path aside.
         if stat(dir.as_fd(), &c)?.is_some_and(|found| found.is_dir()) {
             let mut names =
                 fs::Dir::open_at(dir.as_fd(), &c).map_err(step("opening a directory"))?;
@@ -430,14 +529,26 @@ impl Tree {
     /// read, so the memory does not grow with the directory. Only names
     /// already read are removed, which on ext4 (whose stream positions are
     /// hashes or offsets) leaves the names still to come in the stream, as
-    /// `rm -r` relies on too.
+    /// `rm -r` relies on too. A kept path stays as it is; a directory a
+    /// kept path is in stays, emptied of the rest.
     fn opaque(&self, dir: &mut fs::Dir, path: &[u8], depth: usize) -> Result<(), Failure> {
         if depth > MAX_DEPTH {
             return Err(Failure::Archive("a directory tree is too deep"));
         }
+        let real = match &self.keep {
+            Some(keep) => Some(keep.relative(dir.fd())?),
+            None => None,
+        };
         while let Some(child) = dir.next_name().map_err(step("reading a directory"))? {
             let child_path = join(path, child.as_bytes());
-            if !self.was_seen(&child_path) {
+            let place = match (&self.keep, &real) {
+                (Some(keep), Some(real)) => keep.place_of(&join(real, child.as_bytes())),
+                _ => Place::Free,
+            };
+            if place == Place::Kept {
+                continue;
+            }
+            if place == Place::Free && !self.was_seen(&child_path) {
                 remove(dir.fd(), &child)?;
                 continue;
             }
@@ -531,8 +642,14 @@ impl Tree {
         if target.is_empty() {
             return Err(Failure::Archive("a hard link names the root"));
         }
+        // Not to a kept file: the image's own file there was skipped, and
+        // a link would change the kept one's link count.
+        self.check_named(&target)?;
         let (target_parent, target_name) = split(&target);
         let target_dir = self.open_dir(target_parent, false)?.ok_or_else(missing)?;
+        if self.real_place(target_dir.as_fd(), target_name)? == Place::Kept {
+            return Err(Failure::Kept);
+        }
         let target_name = c_name(target_name)?;
         let found = stat(target_dir.as_fd(), &target_name)?.ok_or_else(missing)?;
         if found.is_dir() {

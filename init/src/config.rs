@@ -1,7 +1,8 @@
-//! The machine's configuration, read from `fw_cfg` (interface versions 1,
-//! 2 and 3): the process to run (from version 3, possibly the image's own
+//! The machine's configuration, read from `fw_cfg` (interface versions 1
+//! to 4): the process to run (from version 3, possibly the image's own
 //! init system), or (version 2's unpack mode) the image layers to unpack
-//! onto the root disk.
+//! onto the root disk (from version 4, possibly a redeploy keeping some of
+//! its paths).
 //!
 //! The config may carry secrets (environment values, keys), so no error
 //! message here quotes a value: they name the field at most.
@@ -27,10 +28,19 @@ const DEFAULT_STOP_SIGNAL: i32 = 15;
 pub const MAX_SIGNAL: i32 = 64;
 
 /// The config versions this init accepts.
-pub const VERSIONS: &[u64] = &[1, 2, 3];
+pub const VERSIONS: &[u64] = &[1, 2, 3, 4];
 
 /// The first config version with `init_system`.
 const INIT_SYSTEM_VERSION: u64 = 3;
+
+/// The first config version with the unpack mode's `keep`.
+const KEEP_VERSION: u64 = 4;
+
+/// The most paths a redeploy may keep.
+pub const MAX_KEEP: usize = 64;
+
+/// The longest kept path, in bytes (Linux's `PATH_MAX` less its NUL).
+pub const MAX_KEEP_BYTES: usize = 4095;
 
 /// The most layers an unpack config may list.
 pub const MAX_LAYERS: usize = 128;
@@ -70,10 +80,15 @@ pub enum Boot {
 }
 
 /// The unpack mode's config: the layers, in order, as they lie one after
-/// the other on the layers disk.
+/// the other on the layers disk, and (version 4) the paths a redeploy
+/// keeps.
 #[derive(Debug)]
 pub struct Unpack {
     pub layers: Vec<Layer>,
+    /// Version 4's `keep`: present (even empty), the unpack is a redeploy
+    /// onto a disk that need not be empty. Each path without its leading
+    /// `/` (`data/db` for `/data/db`).
+    pub keep: Option<Vec<Vec<u8>>>,
 }
 
 /// One layer of the layers disk.
@@ -304,10 +319,11 @@ fn run_config(value: &Value, version: u64) -> Result<Config, String> {
     Ok(config)
 }
 
-/// The unpack mode's config: `version`, `mode` and `layers`, nothing else.
+/// The unpack mode's config: `version`, `mode`, `layers` and from
+/// version 4 `keep`, nothing else.
 fn unpack_config(object: &serde_json::Map<String, Value>, version: u64) -> Result<Unpack, String> {
     for key in object.keys() {
-        if key == "mode" || key == "layers" {
+        if key == "mode" || key == "layers" || (key == "keep" && version >= KEEP_VERSION) {
             continue;
         }
         if !known_field(key, version) {
@@ -342,7 +358,57 @@ fn unpack_config(object: &serde_json::Map<String, Value>, version: u64) -> Resul
             .ok_or_else(|| format!("config field `layers` entry {index} ends beyond any disk"))?;
         checked.push(layer);
     }
-    Ok(Unpack { layers: checked })
+    let keep = object.get("keep").map(keep_paths).transpose()?;
+    Ok(Unpack {
+        layers: checked,
+        keep,
+    })
+}
+
+/// Version 4's `keep`: 0 to [`MAX_KEEP`] absolute, normalised paths (no
+/// `.`, `..` or empty component, no trailing slash, not `/` itself), each
+/// at most [`MAX_KEEP_BYTES`] bytes, none twice. Each is returned without
+/// its leading `/`.
+fn keep_paths(value: &Value) -> Result<Vec<Vec<u8>>, String> {
+    let Some(entries) = value.as_array() else {
+        return Err("config field `keep` is not a list".into());
+    };
+    if entries.len() > MAX_KEEP {
+        return Err(format!(
+            "config field `keep` holds more than {MAX_KEEP} paths"
+        ));
+    }
+    let mut paths: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let what = |problem: &str| format!("config field `keep` entry {index} {problem}");
+        let Some(text) = entry.as_str() else {
+            return Err(what("is not a string"));
+        };
+        if text.len() > MAX_KEEP_BYTES {
+            return Err(what(&format!("is longer than {MAX_KEEP_BYTES} bytes")));
+        }
+        if text.contains('\0') {
+            return Err(what("holds a NUL byte"));
+        }
+        let Some(relative) = text.strip_prefix('/') else {
+            return Err(what("is not an absolute path"));
+        };
+        if relative.is_empty() {
+            return Err(what("is the root"));
+        }
+        if relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(what("is not a normalised path"));
+        }
+        let path = relative.as_bytes().to_vec();
+        if paths.contains(&path) {
+            return Err(what("is given twice"));
+        }
+        paths.push(path);
+    }
+    Ok(paths)
 }
 
 fn layer(index: usize, entry: &Value) -> Result<Layer, String> {
@@ -702,6 +768,115 @@ mod tests {
             layer_json(TAR, DIGEST, "1")
         );
         assert!(matches!(parse_boot(&text, 3), Ok(Boot::Unpack(_))));
+    }
+
+    /// A version-4 unpack config with `keep` set to the JSON `keep`.
+    fn keep(keep: &str) -> Result<Option<Vec<Vec<u8>>>, String> {
+        let text = format!(
+            r#"{{"version": 4, "mode": "unpack", "layers": [{}]{keep}}}"#,
+            layer_json(TAR, DIGEST, "1")
+        );
+        match parse_boot(&text, 4)? {
+            Boot::Unpack(unpack) => Ok(unpack.keep),
+            Boot::Run(_) => panic!("not the unpack mode"),
+        }
+    }
+
+    #[test]
+    fn version_four_keep() {
+        assert_eq!(keep("").unwrap(), None);
+        assert_eq!(keep(r#", "keep": []"#).unwrap(), Some(vec![]));
+        assert_eq!(
+            keep(r#", "keep": ["/data", "/var/lib/db", "/data/db", "/a b/ü"]"#).unwrap(),
+            Some(vec![
+                b"data".to_vec(),
+                b"var/lib/db".to_vec(),
+                b"data/db".to_vec(),
+                "a b/ü".as_bytes().to_vec()
+            ])
+        );
+        let longest = format!("/{}", "a".repeat(MAX_KEEP_BYTES - 1));
+        assert_eq!(
+            keep(&format!(r#", "keep": ["{longest}"]"#)).unwrap(),
+            Some(vec![longest.as_bytes()[1..].to_vec()])
+        );
+        let many: Vec<String> = (0..MAX_KEEP).map(|n| format!(r#""/p{n}""#)).collect();
+        assert_eq!(
+            keep(&format!(r#", "keep": [{}]"#, many.join(",")))
+                .unwrap()
+                .unwrap()
+                .len(),
+            MAX_KEEP
+        );
+        let too_many: Vec<String> = (0..=MAX_KEEP).map(|n| format!(r#""/p{n}""#)).collect();
+        assert_eq!(
+            keep(&format!(r#", "keep": [{}]"#, too_many.join(","))).unwrap_err(),
+            "config field `keep` holds more than 64 paths"
+        );
+        assert_eq!(
+            keep(&format!(r#", "keep": ["/{}"]"#, "a".repeat(MAX_KEEP_BYTES))).unwrap_err(),
+            "config field `keep` entry 0 is longer than 4095 bytes"
+        );
+        for (value, problem) in [
+            (r#""/""#, "is the root"),
+            (r#""data""#, "is not an absolute path"),
+            (r#""""#, "is not an absolute path"),
+            (r#""/data/""#, "is not a normalised path"),
+            (r#""//data""#, "is not a normalised path"),
+            (r#""/data//db""#, "is not a normalised path"),
+            (r#""/data/./db""#, "is not a normalised path"),
+            (r#""/data/..""#, "is not a normalised path"),
+            (r#""/.""#, "is not a normalised path"),
+            (r#""/a\u0000b""#, "holds a NUL byte"),
+            ("1", "is not a string"),
+            ("null", "is not a string"),
+        ] {
+            assert_eq!(
+                keep(&format!(r#", "keep": ["/ok", {value}]"#)).unwrap_err(),
+                format!("config field `keep` entry 1 {problem}"),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            keep(r#", "keep": ["/data", "/data"]"#).unwrap_err(),
+            "config field `keep` entry 1 is given twice"
+        );
+        assert_eq!(
+            keep(r#", "keep": "/data""#).unwrap_err(),
+            "config field `keep` is not a list"
+        );
+        // Not a field before version 4, nor of the run mode.
+        for version in [2, 3] {
+            let text = format!(
+                r#"{{"version": {version}, "mode": "unpack", "keep": [], "layers": [{}]}}"#,
+                layer_json(TAR, DIGEST, "1")
+            );
+            assert_eq!(
+                parse_boot(&text, u32::try_from(version).unwrap()).unwrap_err(),
+                "the config has an unknown field `keep`"
+            );
+        }
+        assert_eq!(
+            parse_boot(r#"{"version": 4, "argv": ["a"], "keep": []}"#, 4).unwrap_err(),
+            "the config has an unknown field `keep`"
+        );
+        // Version 4 is version 3 elsewhere.
+        let Boot::Run(config) = parse_boot(
+            r#"{"version": 4, "argv": ["/sbin/init"], "init_system": true}"#,
+            4,
+        )
+        .unwrap() else {
+            panic!("not the run mode")
+        };
+        assert!(config.init_system);
+        assert_eq!(
+            parse_boot(r#"{"version": 4, "argv": ["a"]}"#, 3).unwrap_err(),
+            "the config's version is not one this init supports"
+        );
+        assert_eq!(
+            parse_boot(r#"{"version": 3, "argv": ["a"]}"#, 4).unwrap_err(),
+            "the config's version is not the boot's interface version (gh.v)"
+        );
     }
 
     #[test]

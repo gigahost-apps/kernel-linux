@@ -3,6 +3,7 @@
 //! `*at` calls; Linux 5.6 and later).
 
 use super::apply::Tree;
+use super::keep::Keep;
 use super::unpack_layer;
 use crate::config::{Compression, Layer};
 use crate::sys::alloc::peak_during;
@@ -10,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -816,4 +818,197 @@ fn long_names_and_ustar_prefixes() {
     assert_eq!(fs::read(root.join(&long)).unwrap(), b"2");
     assert_eq!(fs::read(root.join(&gnu)).unwrap(), b"3");
     assert!(!root.join("ignored-short-name").exists());
+}
+
+/// Writes `files` (path, contents) under `root`, as an earlier unpack
+/// and the renter left them.
+fn write_files(root: &Path, files: &[(&str, &str)]) {
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+}
+
+/// The kept paths of a redeploy onto the scratch root, and the indexes
+/// of those not found.
+fn resolve_keep(scratch: &Scratch, paths: &[&str]) -> (Keep, Vec<usize>) {
+    let root = fs::File::open(scratch.root()).unwrap();
+    let paths: Vec<Vec<u8>> = paths.iter().map(|path| path.as_bytes().to_vec()).collect();
+    Keep::resolve(root.as_fd(), &paths).unwrap()
+}
+
+/// A redeploy's first step on the scratch root: the tree to unpack onto.
+fn redeploy_tree(scratch: &Scratch, paths: &[&str]) -> Tree {
+    let (keep, _) = resolve_keep(scratch, paths);
+    let root = fs::File::open(scratch.root()).unwrap();
+    keep.clear(root.as_fd()).unwrap();
+    Tree::with_keep(root.into(), keep)
+}
+
+fn read(path: &Path) -> String {
+    String::from_utf8(fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn a_redeploy_clears_all_but_the_kept_paths() {
+    let scratch = Scratch::new();
+    fs::write(scratch.dir.join("outside"), b"host").unwrap();
+    let root = scratch.root();
+    write_files(
+        &root,
+        &[
+            ("data/db/file", "A"),
+            ("data/x", "x"),
+            ("etc/a-only", "a"),
+            ("srv/www/html/index", "i"),
+            ("srv/www/html/inner/deep", "d"),
+            ("srv/www/other", "o"),
+            ("srv/top", "t"),
+            ("lost+found/found", "f"),
+            ("opt/db/file", "o"),
+            ("opt/other", "o"),
+            ("usr/bin/tool", "t"),
+        ],
+    );
+    fs::set_permissions(root.join("srv"), fs::Permissions::from_mode(0o750)).unwrap();
+    std::os::unix::fs::symlink("/etc", root.join("link")).unwrap();
+    fs::create_dir(root.join("var")).unwrap();
+    std::os::unix::fs::symlink("../opt", root.join("var/lib")).unwrap();
+    let (keep, missing) = resolve_keep(
+        &scratch,
+        &[
+            "data",
+            "srv/www/html",
+            "srv/www/html/inner",
+            "link",
+            "nope/missing",
+            "var/lib/db",
+            "etc/a-only/under-a-file",
+            "usr/bin/none",
+        ],
+    );
+    assert_eq!(missing, [4, 6, 7]);
+    keep.clear(fs::File::open(&root).unwrap().as_fd()).unwrap();
+    assert_eq!(names(&root), ["data", "link", "lost+found", "opt", "srv"]);
+    assert_eq!(names(&root.join("data")), ["db", "x"]);
+    assert_eq!(read(&root.join("data/db/file")), "A");
+    assert_eq!(names(&root.join("srv")), ["www"]);
+    assert_eq!(names(&root.join("srv/www")), ["html"]);
+    assert_eq!(names(&root.join("srv/www/html")), ["index", "inner"]);
+    assert_eq!(read(&root.join("srv/www/html/inner/deep")), "d");
+    // A directory a kept path is in keeps its mode.
+    assert_eq!(mode(&root.join("srv")), 0o750);
+    // A kept symbolic link is the link, not what it points to.
+    assert_eq!(fs::read_link(root.join("link")).unwrap(), Path::new("/etc"));
+    // A path through a symbolic link keeps what it resolves to.
+    assert_eq!(names(&root.join("opt")), ["db"]);
+    assert_eq!(read(&root.join("opt/db/file")), "o");
+    assert_eq!(names(&root.join("lost+found")), ["found"]);
+    assert_eq!(read(&scratch.dir.join("outside")), "host");
+}
+
+#[test]
+fn a_redeploy_keeping_nothing_clears_everything() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    write_files(
+        &root,
+        &[("etc/a-only", "a"), ("lost+found/found", "f"), ("x", "x")],
+    );
+    let mut tree = redeploy_tree(&scratch, &[]);
+    assert_eq!(names(&root), ["lost+found"]);
+    let tar = TarWriter::default().file("etc/b-only", b"b", 0o644).end();
+    unpack_onto(&scratch, &mut tree, &[plain(tar)]).unwrap();
+    assert_eq!(names(&root), ["etc", "lost+found"]);
+    assert_eq!(tree.skipped, 0);
+}
+
+#[test]
+fn layers_never_change_a_kept_path() {
+    let scratch = Scratch::new();
+    fs::write(scratch.dir.join("outside"), b"host").unwrap();
+    let root = scratch.root();
+    write_files(
+        &root,
+        &[
+            ("data/db/file", "A"),
+            ("data/r/inside", "r"),
+            ("srv/www/html/index", "i"),
+            ("srv/www/other", "o"),
+            ("etc/a-only", "a"),
+        ],
+    );
+    std::os::unix::fs::symlink("/etc", root.join("klink")).unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    fs::File::open(root.join("data/r"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let data_mode = mode(&root.join("data"));
+    let mut tree = redeploy_tree(&scratch, &["data", "srv/www/html", "klink"]);
+    assert_eq!(names(&root), ["data", "klink", "srv"]);
+    let layer = TarWriter::default()
+        .dir("./", 0o755)
+        .dir("data/", 0o700)
+        .file("data/db/file", b"B", 0o644)
+        .file("data/.wh..wh..opq", b"", 0o644)
+        .file("data/new", b"n", 0o644)
+        // Through a link of the layer's own into the kept tree.
+        .symlink("x", "/data")
+        .file("x/evil", b"e", 0o644)
+        .file("x/newdir/evil", b"e", 0o644)
+        .hard_link("hl", "data/db/file")
+        .hard_link("hl2", "x/db/file")
+        // A directory a kept path is in takes the image's mode, and
+        // stays a directory.
+        .dir("srv/", 0o711)
+        .file("srv/www", b"not a directory", 0o644)
+        .file("srv/www/html/index", b"B", 0o644)
+        .file("klink", b"B", 0o644)
+        .file("klink/passwd", b"B", 0o644)
+        .file("etc/b-only", b"b", 0o644)
+        // A directory's time set at the layer's end, by then through a
+        // link into the kept tree.
+        .dir("q/r/", 0o755)
+        .symlink("q", "/data")
+        .file(".wh.data", b"", 0o644)
+        // Emptied, not removed: a kept path is in it.
+        .file("srv/.wh.www", b"", 0o644)
+        .end();
+    unpack_onto(&scratch, &mut tree, &[plain(layer)]).unwrap();
+    assert_eq!(tree.skipped, 13);
+    assert_eq!(read(&root.join("data/db/file")), "A");
+    assert_eq!(names(&root.join("data")), ["db", "r"]);
+    assert_eq!(mode(&root.join("data")), data_mode);
+    assert_eq!(
+        fs::metadata(root.join("data/r")).unwrap().mtime(),
+        1_000_000_000
+    );
+    assert_eq!(fs::metadata(root.join("data/db/file")).unwrap().nlink(), 1);
+    assert_eq!(mode(&root.join("srv")), 0o711);
+    assert_eq!(names(&root.join("srv/www")), ["html"]);
+    assert_eq!(read(&root.join("srv/www/html/index")), "i");
+    assert_eq!(
+        fs::read_link(root.join("klink")).unwrap(),
+        Path::new("/etc")
+    );
+    assert_eq!(names(&root.join("etc")), ["b-only"]);
+    assert_eq!(names(&root), ["data", "etc", "klink", "q", "srv", "x"]);
+    // A second layer's opaque root and opaque directory above a kept path.
+    tree.skipped = 0;
+    let layer = TarWriter::default()
+        .file(".wh..wh..opq", b"", 0o644)
+        .file("fresh", b"f", 0o644)
+        .file("srv/www/.wh..wh..opq", b"", 0o644)
+        .file("srv/www/new", b"n", 0o644)
+        .end();
+    unpack_onto(&scratch, &mut tree, &[plain(layer)]).unwrap();
+    assert_eq!(tree.skipped, 0);
+    assert_eq!(names(&root), ["data", "fresh", "klink", "srv"]);
+    assert_eq!(names(&root.join("srv/www")), ["html", "new"]);
+    assert_eq!(read(&root.join("data/db/file")), "A");
+    assert_eq!(read(&root.join("srv/www/html/index")), "i");
+    assert_eq!(read(&scratch.dir.join("outside")), "host");
+    assert_eq!(scratch.outside(), ["layers.img", "outside", "root"]);
 }
