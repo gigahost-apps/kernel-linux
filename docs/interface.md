@@ -476,7 +476,8 @@ too.
 
 `keep: []` is a redeploy that keeps nothing: the disk is cleared but for
 `lost+found`, then unpacked as a new one. The removal has the bounds of
-the layers' (a tree at most 512 directories deep, a name at a time); the
+the layers' (a tree at most 512 directories deep, a kept path's
+directories counting toward the 512, a name at a time); the
 report is `unpacked` as for any unpack, with the boot's `v` (4).
 
 ### The layer rules

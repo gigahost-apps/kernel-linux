@@ -390,7 +390,7 @@ unpack_cmdline=${v2_cmdline}
 expect_report '{"v":4,"event":"exited","code":0,"signal":null,"reason":"unpacked"}'
 grep -a -q 'gigahost-init: cleared the root disk but for the kept paths' "${case_dir}/serial.log" \
     || fail "no line saying the root was cleared"
-grep -a -q -E "gigahost-init: layer ${#image_layers[@]}: 2 entries at kept paths skipped" "${case_dir}/serial.log" \
+grep -a -q -E "gigahost-init: layer ${#image_layers[@]}: kept paths: 2 entries skipped" "${case_dir}/serial.log" \
     || fail "no line counting B's skipped entries"
 [[ $(debugfs -R 'cat /data/db/file' "${case_dir}/disk.img" 2> /dev/null) == A ]] \
     || fail "/data/db/file is not A's"

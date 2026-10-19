@@ -458,7 +458,7 @@ fn unpack(config: &Unpack) -> Result<(), String> {
         log(&format!("unpacked layer {index}"));
         if tree.skipped > 0 {
             log(&format!(
-                "layer {index}: {} entries at kept paths skipped",
+                "layer {index}: kept paths: {} entries skipped",
                 tree.skipped
             ));
             tree.skipped = 0;
