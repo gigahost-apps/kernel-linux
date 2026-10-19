@@ -395,8 +395,8 @@ In the unpack mode the init:
    `/dev/vda` (ext4) read-only and refuses it, unchanged, unless it is
    empty but for `lost+found` (`the root disk is not empty`); then
    remounts it read-write. A redeploy (a config with `keep`) takes a disk
-   that is not empty, and clears it before the first layer (see The
-   redeploy);
+   that is not empty: it finds the kept paths while the disk is still
+   read-only, and clears it before the first layer (see The redeploy);
 3. for each layer in order: reads exactly `size` bytes from its offset of
    the layers disk, hashing them with SHA-256 as it streams them,
    decompresses them as the media type says and applies the tar stream to
@@ -425,6 +425,9 @@ failure, never what the archive holds:
 - `layer N: an extended attribute does not fit` (larger than the file
   system keeps for one file)
 - `layer N: it expands to more than the root disk can hold`
+- `kept path N is a symbolic link`, `kept path N passes through a
+  symbolic link` (a redeploy only, N the path's index in `keep`, the disk
+  unchanged; see The redeploy)
 - `clearing the root failed` (a redeploy only; see The redeploy)
 
 ### The redeploy (version 4)
@@ -438,19 +441,25 @@ end but `unpacked`: the init does not undo a failed redeploy itself.
 Before the first layer the init:
 
 1. finds each kept path inside the root disk as it resolves every path
-   (`openat2` with `RESOLVE_IN_ROOT`), its last component never followed:
-   a kept symbolic link is kept as the link itself, not what it points
-   to, and a path through a symbolic link keeps what it resolves to, at
-   the place it resolves to (the links on the way are not kept). A kept
-   path that does not exist is logged (by its index in `keep`) and not
-   kept: the new image's own entries are unpacked there;
+   (`openat2` with `RESOLVE_IN_ROOT`), while the disk is still
+   read-only. A kept path must name where its data is: one that is a
+   symbolic link refuses the redeploy (`kept path N is a symbolic link`),
+   and so does one that a symbolic link on its way leads elsewhere
+   (`kept path N passes through a symbolic link`), the disk unchanged.
+   Keeping only the link would remove what it points to, and keeping
+   what it points to would leave the data where the path need not lead
+   once the new image is in; the path the link leads to can be kept
+   instead. A kept path that does not exist is logged (by its index in
+   `keep`) and not kept: the new image's own entries are unpacked there;
 2. removes everything on the root disk but the kept paths, each a whole
    tree, the directories they are in (each directory itself, with its
    owner and mode as on the disk: its other entries are removed) and
    the root's `lost+found`. **Every other file of the disk is removed**:
    the renter's data outside the kept paths does not survive a redeploy.
-   A failure here is `clearing the root failed`, its cause logged on the
-   serial console.
+   A kept tree is kept as it is, its symbolic links too, but what they
+   point to outside the kept paths is removed with the rest.
+   A failure here, or in step 1 but for its refusals, is `clearing the
+   root failed`, its cause logged on the serial console.
 
 Then the layers are applied by the rules below, but nothing at or inside
 a kept path is created, replaced, changed or removed: an entry there of

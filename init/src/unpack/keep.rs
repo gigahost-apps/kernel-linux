@@ -3,13 +3,19 @@
 //! of everything else before the first layer.
 //!
 //! A kept path is found as every path is (`openat2` with
-//! `RESOLVE_IN_ROOT`), its last component never followed: a kept symbolic
-//! link is the link itself. What it resolves to is its real path, the
-//! directories' names from the root. Every check of a change against the
-//! kept paths uses the real path of the directory the change is made in,
-//! read back from `/proc/self/fd` (the kernel's own name for it), so no
-//! route through symbolic links, a layer's or the disk's, reaches into a
-//! kept tree unseen.
+//! `RESOLVE_IN_ROOT`), and must be where it is named: one that is a
+//! symbolic link, or that a symbolic link on its way leads elsewhere,
+//! refuses the redeploy ([`Failure::KeptLink`]). Keeping only the link
+//! would remove what it points to; keeping what it points to would leave
+//! the data where the named path may no longer lead once the new image's
+//! layers are in (they skip the named path, and may make a linked
+//! directory a real one), so a later redeploy would not find it. A kept
+//! path's name is thus its real path on the disk, the directories' names
+//! from the root. Every check of a change against the kept paths uses the
+//! real path of the directory the change is made in, read back from
+//! `/proc/self/fd` (the kernel's own name for it), so no route through
+//! symbolic links, a layer's or the disk's, reaches into a kept tree
+//! unseen.
 
 use super::Failure;
 use super::apply::{MAX_DEPTH, c_name, join, remove_below, split, stat};
@@ -62,10 +68,9 @@ fn fd_path(fd: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
 /// The kept paths of a redeploy, those found on the disk.
 #[derive(Debug)]
 pub struct Keep {
-    /// As the config names them (without the leading `/`).
-    named: Vec<Vec<u8>>,
-    /// Where they are on the disk: their real paths from the root.
-    real: Vec<Vec<u8>>,
+    /// As the config names them (without the leading `/`), which is
+    /// where they are on the disk: their real paths from the root.
+    paths: Vec<Vec<u8>>,
     /// The root's own name, as [`fd_path`] gives it.
     root: Vec<u8>,
 }
@@ -73,11 +78,12 @@ pub struct Keep {
 impl Keep {
     /// Finds `paths` (the config's, without their leading `/`) inside
     /// `root`; the indexes of those that do not exist come back with it,
-    /// and are not kept.
+    /// and are not kept. One that is a symbolic link, or whose directory
+    /// is reached through one, is [`Failure::KeptLink`]. Nothing is
+    /// written.
     pub fn resolve(root: BorrowedFd<'_>, paths: &[Vec<u8>]) -> Result<(Keep, Vec<usize>), Failure> {
         let mut keep = Keep {
-            named: Vec::new(),
-            real: Vec::new(),
+            paths: Vec::new(),
             root: fd_path(root).map_err(|error| Failure::Apply("resolving the root", error))?,
         };
         let mut missing = Vec::new();
@@ -102,41 +108,55 @@ impl Keep {
                 }
             };
             let borrowed = dir.as_fd();
-            if stat(borrowed, &c_name(name)?)?.is_none() {
+            let Some(found) = stat(borrowed, &c_name(name)?)? else {
                 missing.push(index);
                 continue;
+            };
+            // The directory's real path is its name unless a symbolic
+            // link on the way was followed: the config's paths are
+            // normalised (no `.` or `..`), and what a link leads to is
+            // never at the link's own path.
+            if keep.relative(borrowed)? != parent {
+                return Err(Failure::KeptLink {
+                    index,
+                    through: true,
+                });
             }
-            let real = join(&keep.relative(borrowed)?, name);
-            keep.named.push(path.clone());
-            keep.real.push(real);
+            if found.is_symlink() {
+                return Err(Failure::KeptLink {
+                    index,
+                    through: false,
+                });
+            }
+            keep.paths.push(path.clone());
         }
         Ok((keep, missing))
     }
 
     /// No kept path was found.
     pub fn is_empty(&self) -> bool {
-        self.real.is_empty()
+        self.paths.is_empty()
     }
 
     /// Where the cleaned path `path`, as an entry names it, is against
-    /// the kept paths as the config names them.
+    /// the kept paths.
     pub fn named(&self, path: &[u8]) -> Place {
-        place(&self.named, path)
+        place(&self.paths, path)
     }
 
     /// Where the real path `real` is.
     pub fn place_of(&self, real: &[u8]) -> Place {
-        place(&self.real, real)
+        place(&self.paths, real)
     }
 
     /// Where the open directory `dir` is on the disk.
     pub fn dir_place(&self, dir: BorrowedFd<'_>) -> Result<Place, Failure> {
-        Ok(place(&self.real, &self.relative(dir)?))
+        Ok(place(&self.paths, &self.relative(dir)?))
     }
 
     /// Where `name` in the open directory `dir` is on the disk.
     pub fn real_place(&self, dir: BorrowedFd<'_>, name: &[u8]) -> Result<Place, Failure> {
-        Ok(place(&self.real, &join(&self.relative(dir)?, name)))
+        Ok(place(&self.paths, &join(&self.relative(dir)?, name)))
     }
 
     /// The real path from the root of the open directory `dir`, `""` for
@@ -192,7 +212,7 @@ impl Keep {
                     continue;
                 }
                 let child_path = join(path, child.as_bytes());
-                match place(&self.real, &child_path) {
+                match place(&self.paths, &child_path) {
                     Place::Kept => {}
                     Place::Ancestor => {
                         // Always a directory: the kept path was found

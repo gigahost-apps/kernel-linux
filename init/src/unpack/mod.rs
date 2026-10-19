@@ -57,6 +57,10 @@ pub enum Failure {
     /// The entry is at or inside a kept path of a redeploy: it is
     /// skipped, never reported.
     Kept,
+    /// The kept path `index` of a redeploy is a symbolic link, or
+    /// (`through`) a symbolic link on its way leads elsewhere: the
+    /// redeploy is refused.
+    KeptLink { index: usize, through: bool },
 }
 
 /// Marks a stream error with where it arose.
@@ -116,6 +120,14 @@ impl Failure {
             }
             Failure::Apply(what, error) => format!("{what} failed: {error}"),
             Failure::Kept => "an entry is at a kept path".into(),
+            Failure::KeptLink {
+                index,
+                through: false,
+            } => format!("kept path {index} is a symbolic link"),
+            Failure::KeptLink {
+                index,
+                through: true,
+            } => format!("kept path {index} passes through a symbolic link"),
         }
     }
 }
@@ -345,26 +357,39 @@ fn expansion_limit() -> u64 {
         .saturating_add(1 << 30)
 }
 
-/// A redeploy's first step: finds the kept paths and removes everything
-/// else on the root. A failure is reported as one kind, its cause logged
-/// (it names no path); the agent rolls the disk back.
-pub fn clear_root(root: BorrowedFd<'_>, paths: &[Vec<u8>]) -> Result<Keep, String> {
-    let failed = |failure: Failure| {
-        log(&format!(
-            "clearing the root: {}",
-            failure.message(Compression::None)
-        ));
-        String::from("clearing the root failed")
-    };
-    let (keep, missing) = Keep::resolve(root, paths).map_err(failed)?;
+/// A redeploy's failure as one kind, its cause logged (it names no path);
+/// the agent rolls the disk back.
+fn clearing_failed(failure: &Failure) -> String {
+    log(&format!(
+        "clearing the root: {}",
+        failure.message(Compression::None)
+    ));
+    String::from("clearing the root failed")
+}
+
+/// A redeploy's first step, on the disk still read-only: finds the kept
+/// paths. One that is a symbolic link or passes through one refuses the
+/// redeploy by its index, the disk unchanged.
+pub fn find_kept(root: BorrowedFd<'_>, paths: &[Vec<u8>]) -> Result<Keep, String> {
+    let (keep, missing) = Keep::resolve(root, paths).map_err(|failure| match failure {
+        Failure::KeptLink { .. } => failure.message(Compression::None),
+        _ => clearing_failed(&failure),
+    })?;
     for index in missing {
         log(&format!(
             "kept path {index} does not exist on the root disk: not kept"
         ));
     }
-    keep.clear(root).map_err(failed)?;
-    log("cleared the root disk but for the kept paths");
     Ok(keep)
+}
+
+/// A redeploy's second step: removes everything on the root but the kept
+/// paths.
+pub fn clear_root(root: BorrowedFd<'_>, keep: &Keep) -> Result<(), String> {
+    keep.clear(root)
+        .map_err(|failure| clearing_failed(&failure))?;
+    log("cleared the root disk but for the kept paths");
+    Ok(())
 }
 
 /// The unpack mode's steps 2 to 5: never returns.
@@ -385,8 +410,9 @@ pub fn run(config: &Unpack) -> ! {
 fn unpack(config: &Unpack) -> Result<(), String> {
     setup::wait_for(DISK)?;
     setup::wait_for(LAYERS)?;
-    // Read-only until it is known to be empty, so a disk refused here is
-    // left as it was; a redeploy takes the disk as it is.
+    // Read-only until it is known to be empty, or a redeploy's kept paths
+    // are found, so a disk refused here is left as it was; a redeploy
+    // takes the disk as it is.
     let flags = mount::NOSUID | mount::NODEV | mount::NOEXEC;
     mount::mount(
         Some(DISK),
@@ -396,26 +422,31 @@ fn unpack(config: &Unpack) -> Result<(), String> {
         None,
     )
     .map_err(|error| format!("mounting the root disk failed: {error}"))?;
-    if config.keep.is_none() {
-        let entries = std::fs::read_dir(NEWROOT)
-            .map_err(|error| format!("reading the root disk failed: {error}"))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("reading the root disk failed: {error}"))?;
-            if entry.file_name() != "lost+found" {
-                return Err("the root disk is not empty".into());
+    let root = std::fs::File::open(NEWROOT)
+        .map_err(|error| format!("opening the root disk failed: {error}"))?;
+    let keep = match &config.keep {
+        None => {
+            let entries = std::fs::read_dir(NEWROOT)
+                .map_err(|error| format!("reading the root disk failed: {error}"))?;
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| format!("reading the root disk failed: {error}"))?;
+                if entry.file_name() != "lost+found" {
+                    return Err("the root disk is not empty".into());
+                }
             }
+            None
         }
-    }
+        Some(paths) => Some(find_kept(root.as_fd(), paths)?),
+    };
     mount::mount(None, NEWROOT, None, flags | mount::REMOUNT, None)
         .map_err(|error| format!("mounting the root disk failed: {error}"))?;
     let disk = std::fs::File::open(LAYERS)
         .map_err(|error| format!("opening the layers disk failed: {error}"))?;
-    let root = std::fs::File::open(NEWROOT)
-        .map_err(|error| format!("opening the root disk failed: {error}"))?;
-    let mut tree = match &config.keep {
+    let mut tree = match keep {
         None => Tree::new(root.into()),
-        Some(paths) => {
-            let keep = clear_root(root.as_fd(), paths)?;
+        Some(keep) => {
+            clear_root(root.as_fd(), &keep)?;
             Tree::with_keep(root.into(), keep)
         }
     };

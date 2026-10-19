@@ -872,7 +872,7 @@ fn a_redeploy_clears_all_but_the_kept_paths() {
         ],
     );
     fs::set_permissions(root.join("srv"), fs::Permissions::from_mode(0o750)).unwrap();
-    std::os::unix::fs::symlink("/etc", root.join("link")).unwrap();
+    std::os::unix::fs::symlink("/etc", root.join("data/link")).unwrap();
     fs::create_dir(root.join("var")).unwrap();
     std::os::unix::fs::symlink("../opt", root.join("var/lib")).unwrap();
     let (keep, missing) = resolve_keep(
@@ -881,17 +881,18 @@ fn a_redeploy_clears_all_but_the_kept_paths() {
             "data",
             "srv/www/html",
             "srv/www/html/inner",
-            "link",
             "nope/missing",
-            "var/lib/db",
+            "opt/db",
             "etc/a-only/under-a-file",
             "usr/bin/none",
+            // Through a symbolic link, but there is nothing to keep.
+            "var/lib/none",
         ],
     );
-    assert_eq!(missing, [4, 6, 7]);
+    assert_eq!(missing, [3, 5, 6, 7]);
     keep.clear(fs::File::open(&root).unwrap().as_fd()).unwrap();
-    assert_eq!(names(&root), ["data", "link", "lost+found", "opt", "srv"]);
-    assert_eq!(names(&root.join("data")), ["db", "x"]);
+    assert_eq!(names(&root), ["data", "lost+found", "opt", "srv"]);
+    assert_eq!(names(&root.join("data")), ["db", "link", "x"]);
     assert_eq!(read(&root.join("data/db/file")), "A");
     assert_eq!(names(&root.join("srv")), ["www"]);
     assert_eq!(names(&root.join("srv/www")), ["html"]);
@@ -899,13 +900,89 @@ fn a_redeploy_clears_all_but_the_kept_paths() {
     assert_eq!(read(&root.join("srv/www/html/inner/deep")), "d");
     // A directory a kept path is in keeps its mode.
     assert_eq!(mode(&root.join("srv")), 0o750);
-    // A kept symbolic link is the link, not what it points to.
-    assert_eq!(fs::read_link(root.join("link")).unwrap(), Path::new("/etc"));
-    // A path through a symbolic link keeps what it resolves to.
+    // A symbolic link inside a kept tree is kept as it is; what it points
+    // to, outside the kept paths, is not.
+    assert_eq!(
+        fs::read_link(root.join("data/link")).unwrap(),
+        Path::new("/etc")
+    );
     assert_eq!(names(&root.join("opt")), ["db"]);
     assert_eq!(read(&root.join("opt/db/file")), "o");
     assert_eq!(names(&root.join("lost+found")), ["found"]);
     assert_eq!(read(&scratch.dir.join("outside")), "host");
+}
+
+/// The message of the refusal of a redeploy keeping `paths`.
+fn refused(scratch: &Scratch, paths: &[&str]) -> String {
+    let root = fs::File::open(scratch.root()).unwrap();
+    let paths: Vec<Vec<u8>> = paths.iter().map(|path| path.as_bytes().to_vec()).collect();
+    Keep::resolve(root.as_fd(), &paths)
+        .unwrap_err()
+        .message(Compression::None)
+}
+
+#[test]
+fn a_kept_path_a_symbolic_link_leads_elsewhere_is_refused() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    write_files(
+        &root,
+        &[
+            ("srv/data/file", "d"),
+            ("opt/db/file", "o"),
+            ("etc/passwd", "p"),
+        ],
+    );
+    // The disk's links: one to the data, one dangling, a linked parent
+    // directory, a link to the root.
+    std::os::unix::fs::symlink("/srv/data", root.join("data")).unwrap();
+    std::os::unix::fs::symlink("/nowhere", root.join("dangling")).unwrap();
+    fs::create_dir(root.join("var")).unwrap();
+    std::os::unix::fs::symlink("../opt", root.join("var/lib")).unwrap();
+    std::os::unix::fs::symlink("/", root.join("top")).unwrap();
+    let before = |root: &Path| {
+        (
+            names(root),
+            names(&root.join("srv/data")),
+            names(&root.join("opt/db")),
+        )
+    };
+    let listed = before(&root);
+    assert_eq!(
+        refused(&scratch, &["etc", "data"]),
+        "kept path 1 is a symbolic link"
+    );
+    assert_eq!(
+        refused(&scratch, &["dangling"]),
+        "kept path 0 is a symbolic link"
+    );
+    assert_eq!(
+        refused(&scratch, &["var/lib"]),
+        "kept path 0 is a symbolic link"
+    );
+    assert_eq!(
+        refused(&scratch, &["etc", "var/lib/db"]),
+        "kept path 1 passes through a symbolic link"
+    );
+    assert_eq!(
+        refused(&scratch, &["top/etc/passwd"]),
+        "kept path 0 passes through a symbolic link"
+    );
+    assert_eq!(
+        refused(&scratch, &["data/file"]),
+        "kept path 0 passes through a symbolic link"
+    );
+    // Nothing is removed or changed.
+    assert_eq!(before(&root), listed);
+    assert_eq!(read(&root.join("srv/data/file")), "d");
+    assert_eq!(read(&root.join("opt/db/file")), "o");
+    // Named where they are, the same trees are kept.
+    let (keep, missing) = resolve_keep(&scratch, &["srv/data", "opt/db"]);
+    assert!(missing.is_empty());
+    keep.clear(fs::File::open(&root).unwrap().as_fd()).unwrap();
+    assert_eq!(names(&root), ["opt", "srv"]);
+    assert_eq!(read(&root.join("srv/data/file")), "d");
+    assert_eq!(read(&root.join("opt/db/file")), "o");
 }
 
 #[test]
@@ -939,15 +1016,14 @@ fn layers_never_change_a_kept_path() {
             ("etc/a-only", "a"),
         ],
     );
-    std::os::unix::fs::symlink("/etc", root.join("klink")).unwrap();
     let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
     fs::File::open(root.join("data/r"))
         .unwrap()
         .set_modified(old)
         .unwrap();
     let data_mode = mode(&root.join("data"));
-    let mut tree = redeploy_tree(&scratch, &["data", "srv/www/html", "klink"]);
-    assert_eq!(names(&root), ["data", "klink", "srv"]);
+    let mut tree = redeploy_tree(&scratch, &["data", "srv/www/html"]);
+    assert_eq!(names(&root), ["data", "srv"]);
     let layer = TarWriter::default()
         .dir("./", 0o755)
         .dir("data/", 0o700)
@@ -965,8 +1041,6 @@ fn layers_never_change_a_kept_path() {
         .dir("srv/", 0o711)
         .file("srv/www", b"not a directory", 0o644)
         .file("srv/www/html/index", b"B", 0o644)
-        .file("klink", b"B", 0o644)
-        .file("klink/passwd", b"B", 0o644)
         .file("etc/b-only", b"b", 0o644)
         // A directory's time set at the layer's end, by then through a
         // link into the kept tree.
@@ -977,7 +1051,7 @@ fn layers_never_change_a_kept_path() {
         .file("srv/.wh.www", b"", 0o644)
         .end();
     unpack_onto(&scratch, &mut tree, &[plain(layer)]).unwrap();
-    assert_eq!(tree.skipped, 13);
+    assert_eq!(tree.skipped, 11);
     assert_eq!(read(&root.join("data/db/file")), "A");
     assert_eq!(names(&root.join("data")), ["db", "r"]);
     assert_eq!(mode(&root.join("data")), data_mode);
@@ -989,12 +1063,8 @@ fn layers_never_change_a_kept_path() {
     assert_eq!(mode(&root.join("srv")), 0o711);
     assert_eq!(names(&root.join("srv/www")), ["html"]);
     assert_eq!(read(&root.join("srv/www/html/index")), "i");
-    assert_eq!(
-        fs::read_link(root.join("klink")).unwrap(),
-        Path::new("/etc")
-    );
     assert_eq!(names(&root.join("etc")), ["b-only"]);
-    assert_eq!(names(&root), ["data", "etc", "klink", "q", "srv", "x"]);
+    assert_eq!(names(&root), ["data", "etc", "q", "srv", "x"]);
     // A second layer's opaque root and opaque directory above a kept path.
     tree.skipped = 0;
     let layer = TarWriter::default()
@@ -1005,7 +1075,7 @@ fn layers_never_change_a_kept_path() {
         .end();
     unpack_onto(&scratch, &mut tree, &[plain(layer)]).unwrap();
     assert_eq!(tree.skipped, 0);
-    assert_eq!(names(&root), ["data", "fresh", "klink", "srv"]);
+    assert_eq!(names(&root), ["data", "fresh", "srv"]);
     assert_eq!(names(&root.join("srv/www")), ["html", "new"]);
     assert_eq!(read(&root.join("data/db/file")), "A");
     assert_eq!(read(&root.join("srv/www/html/index")), "i");

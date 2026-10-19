@@ -346,9 +346,10 @@ cmp -s "${case_dir}/big.out" "${work}/big/big" || fail "the unpacked 512 MiB fil
 rm -rf "${work}/big" "${case_dir}"
 show_logs "${before}"
 
-# U6–U10. Version 4's redeploy. Image A is the feature image with the
-# fixture and a layer of its own; image B is the feature image with
-# another, whose /data is opaque and has a /data/db/file of its own.
+# U6–U11. Version 4's redeploy. Image A is the feature image with the
+# fixture and a layer of its own (with /vol, a symbolic link to /data);
+# image B is the feature image with another, whose /data is opaque and
+# has a /data/db/file of its own.
 v4_cmdline="console=ttyS0 quiet gh.v=4 gh.hostname=case-host ${network}"
 # unpack_config IN OUT VERSION [KEEP_JSON]: IN's unpack config in VERSION,
 # with "keep": KEEP_JSON when given.
@@ -364,7 +365,7 @@ PYTHON
 }
 tar_layer "${work}/a.tar" \
     "dir:data:0755" "file:data/db/file:0644:A" "file:etc/a-only:0644:a" \
-    "file:usr/bin/tool:0755:a-tool"
+    "file:usr/bin/tool:0755:a-tool" "link:vol:/data"
 tar_layer "${work}/b.tar" \
     "file:data/.wh..wh..opq:0644:" "file:data/db/file:0644:B" "file:etc/b-only:0644:b" \
     "file:usr/local/bin/b-process:0755:echo image-b; cat /data/db/file; echo; ls /etc/a-only /usr/bin/tool 2>&1 || true"
@@ -442,7 +443,20 @@ cmp -s "${case_dir}/disk.img" "${work}/a.img" || fail "the disk changed"
 rm -f "${case_dir}/disk.img"
 show_logs "${before}"
 
-# U10. A version-4 unpack without keep still refuses a disk that is not
+# U10. A redeploy keeping a path that a symbolic link leads elsewhere
+# (/vol/db, which is A's /data/db) is refused by the path's index, while
+# the disk is read-only: the disk is unchanged.
+before=${failures}
+unpack_config "${work}/b.json" "${work}/b-keep-link.json" 4 '["/data","/vol/db"]'
+unpack_cmdline=${v4_cmdline}
+unpack_boot keep-link "${work}/b-keep-link.json" "${work}/b-layers.img" "" "" "${work}/a.img"
+unpack_cmdline=${v2_cmdline}
+expect_report '"v":4,"event":"exited","code":null,"signal":null,"reason":"error","message":"kept path 1 passes through a symbolic link"'
+cmp -s "${case_dir}/disk.img" "${work}/a.img" || fail "the disk changed"
+rm -f "${case_dir}/disk.img"
+show_logs "${before}"
+
+# U11. A version-4 unpack without keep still refuses a disk that is not
 # empty, unchanged.
 before=${failures}
 unpack_config "${work}/b.json" "${work}/b-v4.json" 4

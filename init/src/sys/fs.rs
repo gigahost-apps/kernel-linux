@@ -47,6 +47,10 @@ impl Stat {
     pub fn is_dir(&self) -> bool {
         self.mode & libc::S_IFMT == libc::S_IFDIR
     }
+
+    pub fn is_symlink(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFLNK
+    }
 }
 
 fn owned(rc: libc::c_int) -> io::Result<OwnedFd> {
