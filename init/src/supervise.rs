@@ -24,6 +24,10 @@ struct State {
 
 struct Shared {
     main: i32,
+    /// Whom the stop's escalation signals: -1, every process but this
+    /// init (`kill(-1, …)` from PID 1, as [`process::kill_all`]); a test's
+    /// own process group instead.
+    everyone: i32,
     /// What a stop sends the main process first (the config's
     /// `stop_signal`).
     stop_signal: i32,
@@ -76,9 +80,9 @@ impl Shared {
         if self.main_ended() {
             return;
         }
-        process::kill_all(SIGTERM);
+        process::kill(self.everyone, SIGTERM);
         std::thread::sleep(GRACE);
-        process::kill_all(SIGKILL);
+        process::kill(self.everyone, SIGKILL);
     }
 }
 
@@ -120,6 +124,7 @@ pub fn run(
 ) -> ! {
     let shared = Arc::new(Shared {
         main,
+        everyone: -1,
         stop_signal,
         default_timeout_seconds,
         state: Mutex::new(State::default()),
@@ -293,8 +298,10 @@ mod tests {
             .spawn()
             .unwrap();
         let sigrtmin_3 = libc::SIGRTMIN() + 3;
+        let main = i32::try_from(child.id()).unwrap();
         let shared = Arc::new(Shared {
-            main: i32::try_from(child.id()).unwrap(),
+            main,
+            everyone: main,
             stop_signal: sigrtmin_3,
             default_timeout_seconds: 300,
             state: Mutex::new(State::default()),
@@ -312,8 +319,10 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
+        let main = i32::try_from(child.id()).unwrap();
         let shared = Arc::new(Shared {
-            main: i32::try_from(child.id()).unwrap(),
+            main,
+            everyone: main,
             stop_signal: libc::SIGUSR1,
             default_timeout_seconds: 300,
             state: Mutex::new(State::default()),
@@ -325,5 +334,57 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGUSR1));
         assert!(shared.lock().stop_requested);
         drop(guard);
+    }
+
+    /// A process that does nothing on its stop signal (as a namespace's
+    /// PID 1 without a handler for it, a shell entrypoint say) survives
+    /// it and the SIGTERM to all after the timeout, and ends by the
+    /// SIGKILL to all [`GRACE`] later. The child and its own child form
+    /// a process group of their own, which stands for every process here.
+    #[test]
+    fn a_stop_kills_a_process_that_ignores_its_signal_after_the_timeout() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; echo ready; while :; do sleep 1; done"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // The trap is set once the shell says so; a stop before it would
+        // end the shell by its first signal.
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let main = i32::try_from(child.id()).unwrap();
+        let shared = Arc::new(Shared {
+            main,
+            everyone: -main,
+            stop_signal: SIGTERM,
+            default_timeout_seconds: 300,
+            state: Mutex::new(State::default()),
+        });
+        let guard = Ended(Arc::clone(&shared));
+        let timeout = Duration::from_secs(1);
+        let latest = timeout + GRACE + Duration::from_secs(5);
+        let started = Instant::now();
+        shared.request_stop(Some(1));
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > latest {
+                process::kill(-main, SIGKILL);
+                let _ = child.wait();
+                panic!("the process still ran {latest:?} after the stop");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let elapsed = started.elapsed();
+        drop(guard);
+        assert_eq!(status.signal(), Some(SIGKILL));
+        assert!(elapsed >= timeout + GRACE, "ended after {elapsed:?}");
     }
 }

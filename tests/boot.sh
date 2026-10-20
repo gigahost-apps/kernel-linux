@@ -11,7 +11,9 @@
 # podman, qemu-system-x86_64, /dev/kvm, mkfs.ext4, debugfs, python3, gzip
 # and zstd. There is no
 # vsock device here, so the reports are read from the serial console (the
-# agent's fallback); the stop command is covered by the unit tests.
+# agent's fallback); the stop command's signals and its escalation to
+# SIGKILL are covered by the unit tests (init/src/supervise.rs); that a
+# namespace's PID 1 drops a signal it has no handler for is the kernel's.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)

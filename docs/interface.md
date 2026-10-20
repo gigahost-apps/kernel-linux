@@ -627,8 +627,11 @@ serial log for lines starting with `gigahost-init: report `).
   only), `monotonic_ms` the guest's
   monotonic clock at that moment.
 - `exited`, at most once per boot, and the last report when it comes
-  (a panic, or a reboot or power-off by the process, ends the machine
-  without one; an init system's reboot or power-off is reported):
+  (a panic ends the machine without one; a reboot, halt or power-off by
+  the process is reported since release 6.18.57-gh6, as `exited` by
+  signal 1 for a reboot or 2 for a halt or power-off, with version 3's
+  `init_system` as `reboot` or `poweroff`; before it, only an init
+  system's was):
   - `code`: the exit status when the process exited, else `null`;
   - `signal`: the signal that killed it, else `null`;
   - `reason`: `exited` (it ended by itself), `stopped` (it ended after a
