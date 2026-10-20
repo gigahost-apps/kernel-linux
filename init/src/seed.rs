@@ -83,8 +83,8 @@ fn failed(what: &'static str) -> impl Fn(io::Error) -> Stop {
 
 /// Copies the tree of `source` (the disk's `/run`) into the directory
 /// `target` (the tmpfs), and gives `target` the source's owner, group,
-/// mode and time. An entry named `gigahost` directly in the source is
-/// left out.
+/// mode and time whether or not the copy stopped early. An entry named
+/// `gigahost` directly in the source is left out.
 pub fn copy(source: &mut Dir, target: BorrowedFd<'_>, bounds: Bounds) -> Outcome {
     let mut copy = Copy {
         bounds,
@@ -92,11 +92,13 @@ pub fn copy(source: &mut Dir, target: BorrowedFd<'_>, bounds: Bounds) -> Outcome
         bytes: 0,
         outcome: Outcome::default(),
     };
-    let result = copy
-        .tree(source, target, 1)
-        .and_then(|()| fs::stat_at(source.fd(), c"").map_err(failed("reading /run")))
+    let result = copy.tree(source, target, 1);
+    // The root's own metadata even when its copy stopped, as for every
+    // directory below it.
+    let own = fs::stat_at(source.fd(), c"")
+        .map_err(failed("reading /run"))
         .and_then(|stat| metadata_fd(target, &stat));
-    copy.outcome.stopped = result.err();
+    copy.outcome.stopped = result.and(own).err();
     copy.outcome
 }
 
@@ -392,6 +394,25 @@ mod tests {
         assert_eq!(outcome.stopped, Some(Stop::Entries));
         assert_eq!(outcome.copied, 5);
         assert_eq!(scratch.listing().len(), 5);
+    }
+
+    /// A copy that stops still gives the root the image's metadata.
+    #[test]
+    fn a_stopped_copy_keeps_the_roots_metadata() {
+        let scratch = Scratch::new();
+        for n in 0..3 {
+            stdfs::write(scratch.source().join(format!("f{n}")), "x").unwrap();
+        }
+        stdfs::set_permissions(scratch.source(), stdfs::Permissions::from_mode(0o710)).unwrap();
+        let mtime = stdfs::metadata(scratch.source()).unwrap().mtime();
+        let bounds = Bounds {
+            entries: 1,
+            ..BOUNDS
+        };
+        assert_eq!(scratch.copy(bounds).stopped, Some(Stop::Entries));
+        let target = stdfs::metadata(scratch.target()).unwrap();
+        assert_eq!(target.mode() & 0o7777, 0o710);
+        assert_eq!(target.mtime(), mtime);
     }
 
     #[test]

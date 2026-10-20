@@ -2,7 +2,8 @@
 //! `VOLUME` paths that the root lacks is made a directory (owned by root,
 //! mode 0755), as Docker makes a volume's mount point. A path that exists,
 //! as anything, is left alone; one that cannot be made is logged by its
-//! index and skipped, never failing the boot.
+//! index and skipped, never failing the boot, and so is one in `/proc`,
+//! `/sys` or `/dev` (the init's mounts, not the image's).
 //!
 //! Every path is resolved inside the root (`openat2` with
 //! `RESOLVE_IN_ROOT`): a symbolic link on the way leads somewhere inside
@@ -57,8 +58,20 @@ pub fn make(root: BorrowedFd<'_>, path: &[u8]) -> io::Result<Made> {
     Ok(Made::Created)
 }
 
+/// The top-level directories that are the init's mounts (`/proc`, `/sys`,
+/// `/dev`), not the image's: a volume path below one is not made.
+const SYSTEM: &[&[u8]] = &[b"proc", b"sys", b"dev"];
+
+/// Whether `path` (without its leading `/`) is one of [`SYSTEM`] or below
+/// one.
+pub fn is_system(path: &[u8]) -> bool {
+    let first = path.split(|&byte| byte == b'/').next().unwrap_or_default();
+    SYSTEM.contains(&first)
+}
+
 /// Makes every path of `volumes` the root lacks, in order, and logs what
-/// it did.
+/// it did. A path in the init's own mounts ([`is_system`]) is skipped and
+/// logged by its index.
 pub fn make_all(volumes: &[Vec<u8>]) {
     if volumes.is_empty() {
         return;
@@ -74,6 +87,12 @@ pub fn make_all(volumes: &[Vec<u8>]) {
     };
     let mut created = 0;
     for (index, path) in volumes.iter().enumerate() {
+        if is_system(path) {
+            log(&format!(
+                "volume path {index} was not made: it is in /proc, /sys or /dev"
+            ));
+            continue;
+        }
         match make(root.as_fd(), path) {
             Ok(Made::Created) => created += 1,
             Ok(Made::Existed) => {}
@@ -134,6 +153,16 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = stdfs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn system_paths() {
+        for path in ["proc", "sys", "dev", "proc/x", "sys/fs/cgroup", "dev/shm/a"] {
+            assert!(is_system(path.as_bytes()), "{path}");
+        }
+        for path in ["process", "system/x", "devices", "app/proc", "data/dev"] {
+            assert!(!is_system(path.as_bytes()), "{path}");
         }
     }
 
