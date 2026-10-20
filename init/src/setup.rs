@@ -8,13 +8,16 @@ use crate::console::{self, fail, log};
 use crate::etc;
 use crate::grow;
 use crate::protocol::{self, Report};
+use crate::seed;
 use crate::supervise;
 use crate::sys::{self, mount, net, process};
 use crate::unpack;
 use crate::user::{self, ExecUser};
+use crate::volumes;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -57,6 +60,7 @@ pub fn run() -> ! {
     if let Some(keys) = &config.authorized_keys {
         write_authorized_keys(keys).unwrap_or_else(|error| fail(&error));
     }
+    volumes::make_all(&config.volumes);
     let listener = supervise::bind_control(args.vsock);
     let pid = start(&config, &args).unwrap_or_else(|error| fail(&error));
     console::report(&Report::started(pid, sys::monotonic_ms()));
@@ -196,7 +200,7 @@ fn remove_tree(directory: &Path, device: u64) {
 }
 
 /// Step 4: devpts, /dev/shm, /dev/mqueue, cgroup2 and /run, as Docker
-/// mounts them.
+/// mounts them; /run seeded with the image's own (see [`seed`]).
 fn system_mounts() -> Result<(), String> {
     let quiet = mount::NOSUID | mount::NODEV | mount::NOEXEC;
     let each: [(&str, &str, &str, u64, &str); 4] = [
@@ -231,11 +235,27 @@ fn system_mounts() -> Result<(), String> {
     ] {
         let _ = std::os::unix::fs::symlink(target, link);
     }
-    match fs::symlink_metadata("/run") {
-        Ok(_) => {}
-        Err(_) => create_dir("/run", 0o755)
-            .map_err(|error| format!("creating /run on the disk failed: {error}"))?,
-    }
+    // The disk's own /run, opened before the tmpfs covers it, when it is
+    // a directory; a symbolic link there is left as it is (the mount
+    // lands where it leads), with nothing to copy.
+    let root = fs::File::open("/").map_err(|error| format!("opening / failed: {error}"))?;
+    let image_run = match fs::symlink_metadata("/run") {
+        Ok(meta) if meta.is_dir() => match sys::fs::Dir::open_at(root.as_fd(), c"run") {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                log(&format!(
+                    "the image's /run is not copied: opening it failed: {error}"
+                ));
+                None
+            }
+        },
+        Ok(_) => None,
+        Err(_) => {
+            create_dir("/run", 0o755)
+                .map_err(|error| format!("creating /run on the disk failed: {error}"))?;
+            None
+        }
+    };
     mount::mount(
         Some("tmpfs"),
         "/run",
@@ -243,7 +263,40 @@ fn system_mounts() -> Result<(), String> {
         mount::NOSUID | mount::NODEV,
         Some("mode=0755"),
     )
-    .map_err(|error| format!("mounting /run failed: {error}"))
+    .map_err(|error| format!("mounting /run failed: {error}"))?;
+    if let Some(mut image_run) = image_run {
+        seed_run(&mut image_run, &root);
+    }
+    Ok(())
+}
+
+/// Copies the image's /run into the tmpfs now over it; never fails the
+/// boot.
+fn seed_run(image_run: &mut sys::fs::Dir, root: &fs::File) {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    let tmpfs = match sys::fs::open_at(root.as_fd(), c"run", flags, 0) {
+        Ok(tmpfs) => tmpfs,
+        Err(error) => {
+            log(&format!(
+                "the image's /run is not copied: opening the tmpfs failed: {error}"
+            ));
+            return;
+        }
+    };
+    let outcome = seed::copy(image_run, tmpfs.as_fd(), seed::BOUNDS);
+    if outcome.skipped > 0 {
+        log(&format!(
+            "the image's /run: {} FIFO(s), socket(s) or device(s) not copied",
+            outcome.skipped
+        ));
+    }
+    if let Some(stop) = outcome.stopped {
+        log(&format!(
+            "copying the image's /run stopped after {} entries: {}",
+            outcome.copied,
+            stop.describe(&seed::BOUNDS)
+        ));
+    }
 }
 
 /// Step 5: the host name, and /etc/hosts, /etc/resolv.conf and

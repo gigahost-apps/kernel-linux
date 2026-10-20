@@ -14,11 +14,13 @@ mod console;
 mod etc;
 mod grow;
 mod protocol;
+mod seed;
 mod setup;
 mod supervise;
 mod sys;
 mod unpack;
 mod user;
+mod volumes;
 
 fn main() {
     if sys::getpid() != 1 {
@@ -39,7 +41,7 @@ mod tests {
     /// build-info.json.
     #[test]
     fn one_interface_version() {
-        assert_eq!(crate::cmdline::VERSIONS, &[1, 2, 3, 4]);
+        assert_eq!(crate::cmdline::VERSIONS, &[1, 2, 3, 4, 5]);
         let config: Vec<u32> = crate::config::VERSIONS
             .iter()
             .map(|&v| u32::try_from(v).unwrap())

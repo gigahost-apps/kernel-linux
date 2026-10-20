@@ -1,4 +1,4 @@
-# The host ↔ init interface, versions 1 to 4
+# The host ↔ init interface, versions 1 to 5
 
 This is the contract between the host that boots a container machine (the
 agent) and `gigahost-init`, the init in this repository's initramfs. It is
@@ -6,7 +6,7 @@ written for agent authors: everything the agent writes and everything it
 reads back is here.
 
 A release's `build-info.json` lists the interface versions its init accepts
-(`"interface_versions": [1, 2, 3, 4]`). Any change to the kernel command line, the
+(`"interface_versions": [1, 2, 3, 4, 5]`). Any change to the kernel command line, the
 config or the vsock lines below is a new interface version.
 
 Version 2 is version 1 plus the unpack mode (below), in which the init
@@ -27,6 +27,15 @@ the unpack is a redeploy, which moves an instance to another image on
 the same root disk, keeping the paths `keep` names (its volumes) and
 removing everything else. A boot of an earlier version behaves exactly
 as before; a version-4 boot is version 3's in everything else.
+
+Version 5 is version 4 plus `volumes` in the run mode (below): the
+image's `VOLUME` paths, which the init makes as directories before the
+process starts when the image lacks them, as Docker makes a volume's
+mount point. A boot of an earlier version behaves exactly as before; a
+version-5 boot is version 4's in everything else.
+
+In every version, the run mode's `/run` starts as a copy of the image's
+own `/run` (step 4 below; since release 6.18.57-gh6).
 
 ## The machine
 
@@ -72,7 +81,7 @@ console=ttyS0 quiet gh.v=V gh.hostname=NAME gh.ip4=A.B.C.D/P gh.gw4=A.B.C.D
 
 | Key | Required | Value |
 |---|---|---|
-| `gh.v` | yes | The interface version, `1`, `2`, `3` or `4`. Any other value is refused. |
+| `gh.v` | yes | The interface version, `1`, `2`, `3`, `4` or `5`. Any other value is refused. |
 | `gh.hostname` | yes | The host name: dot-separated labels of letters, digits and hyphens (no label starting or ending with a hyphen), 64 bytes at most. |
 | `gh.ip4` | yes | `eth0`'s IPv4 address and prefix length, `A.B.C.D/P` (P 0–32). |
 | `gh.gw4` | yes | The IPv4 default gateway. A gateway outside `gh.ip4`'s prefix gets an on-link host route first. |
@@ -94,7 +103,7 @@ The fw_cfg entry `opt/gigahost/config`, read from
 object, at most 1 MiB (1,048,576 bytes).
 
 A config is of one of two modes. The **run mode** runs the image's
-process; it is all of version 1 and the default of versions 2 to 4:
+process; it is all of version 1 and the default of versions 2 to 5:
 
 ```json
 { "version": 1,
@@ -109,8 +118,8 @@ process; it is all of version 1 and the default of versions 2 to 4:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `version` | yes | The boot's `gh.v`: `1`, `2`, `3` or `4`. Any other value is refused. |
-| `mode` | no | Versions 2 to 4: `"run"` (the default). |
+| `version` | yes | The boot's `gh.v`: `1`, `2`, `3`, `4` or `5`. Any other value is refused. |
+| `mode` | no | Versions 2 to 5: `"run"` (the default). |
 | `argv` | yes | The process and its arguments, not empty. `argv[0]` is searched in the process's `PATH` unless it holds a `/`. The image's entrypoint and command, with the renter's overrides, already combined by the agent. |
 | `env` | no | `KEY=value` entries (a key is not empty). Default: none. |
 | `user` | no | Docker's `user[:group]`, by name or number. Default: root (uid 0, gid 0). |
@@ -119,15 +128,17 @@ process; it is all of version 1 and the default of versions 2 to 4:
 | `stop_signal` | no | The signal a stop sends the process first, as a number, 1–64: the image's `STOPSIGNAL` (for example 3 for `SIGQUIT`). Default: 15 (`SIGTERM`). |
 | `authorized_keys` | no | SSH keys for the platform's stock images: `user` (a name, or a uid; a uid absent from the image's /etc/passwd has home `/`, so the keys go to `/.ssh/authorized_keys`) and `keys` (one key per entry, no line breaks). |
 | `init_system` | no | Version 3 only: `true` runs `argv` as the image's init system (see The init system), `false` (the default) as a process. With `true`, `argv[0]` must be an absolute path (`/sbin/init`, `/lib/systemd/systemd`, `/sbin/openrc-init`: the agent chooses), `user` absent or root (`root`, `0`, `0:0`, `root:root`, `root:0`, `0:root`) and `workdir` absent or `/`; anything else is refused. |
+| `volumes` | no | Version 5 only: the image's `VOLUME` paths, 0 to 64 of them, each absolute and normalised (no `.`, `..` or empty component, no trailing `/`), at most 4095 bytes, not `/` itself, none given twice. Each the image lacks is made a directory before the process starts (see step 7 below). Default: none. |
 
 Unknown fields are refused, at the top level and inside `authorized_keys`;
-a version-1 config has no `mode`, and a version-1 or version-2 config no
-`init_system` (refused as an unknown field). No string may hold a NUL
+a version-1 config has no `mode`, a version-1 or version-2 config no
+`init_system`, and a config before version 5 no `volumes` (each refused
+as an unknown field). No string may hold a NUL
 byte. A boot refuses a config of a later version than its own as one it
 does not support (as it did before that version existed), and one of an
 earlier version as not the boot's.
 
-The **unpack mode** (versions 2 to 4) unpacks the image's layers onto the root
+The **unpack mode** (versions 2 to 5) unpacks the image's layers onto the root
 disk and runs nothing:
 
 ```json
@@ -141,19 +152,20 @@ disk and runs nothing:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `version` | yes | `2`, `3` or `4`, the boot's `gh.v`. |
+| `version` | yes | `2`, `3`, `4` or `5`, the boot's `gh.v`. |
 | `mode` | yes | `"unpack"`. |
 | `layers` | yes | The image's layers, lowest first, 1 to 128 of them, as the image's manifest lists them. Each: `media_type`, `digest` and `size`, nothing else. |
 | `layers[].media_type` | yes | `application/vnd.oci.image.layer.v1.tar`, `application/vnd.oci.image.layer.v1.tar+gzip`, `application/vnd.oci.image.layer.v1.tar+zstd` or `application/vnd.docker.image.rootfs.diff.tar.gzip`. Any other (a non-distributable or foreign layer among them) is refused. |
 | `layers[].digest` | yes | The blob's digest: `sha256:` and 64 lowercase hex digits. |
 | `layers[].size` | yes | The blob's length in bytes, at least 1. |
-| `keep` | no | Version 4 only: present (even empty), the unpack is a redeploy (see The redeploy). The paths of the root disk to keep, 0 to 64 of them: each absolute and normalised (no `.`, `..` or empty component, no trailing `/`), at most 4095 bytes, not `/` itself, none given twice. |
+| `keep` | no | Versions 4 and 5: present (even empty), the unpack is a redeploy (see The redeploy). The paths of the root disk to keep, 0 to 64 of them: each absolute and normalised (no `.`, `..` or empty component, no trailing `/`), at most 4095 bytes, not `/` itself, none given twice. |
 
 A config is of one mode: an unpack config with any run field (`argv`,
 `env`, `user`, `workdir`, `stop_timeout_seconds`, `stop_signal`,
-`authorized_keys`, and in version 3 `init_system`) is refused, and so is
-a run config with `layers` (or `keep`, in any version: it is an unknown
-field there, as it is in an unpack config before version 4).
+`authorized_keys`, from version 3 `init_system`, in version 5 `volumes`)
+is refused, and so is a run config with `layers` (or `keep`, in any
+version: it is an unknown field there, as it is in an unpack config
+before version 4).
 
 The config may carry secrets. The init never writes an `env` value, a key
 or any other config value to the console or into a report; its error
@@ -191,6 +203,28 @@ These are the run mode's steps; the unpack mode's follow.
    `/dev/mqueue`; cgroup2 on `/sys/fs/cgroup` (`nsdelegate`); tmpfs on
    `/run`. `/tmp` stays as the image has it. Adds `/dev/fd`, `/dev/stdin`,
    `/dev/stdout` and `/dev/stderr`.
+
+   The tmpfs on `/run` starts as a copy of the image's own `/run` (the
+   disk's directory, which the tmpfs then covers), so what an image
+   ships there (`/run/mysqld` owned by its user, `/run/php`,
+   `/run/nginx`) is there when its process starts, as under Docker,
+   which mounts nothing on `/run`; every boot still starts from the
+   image's `/run`, never from what an earlier boot left (the disk's
+   `/run` is never written). Directories, regular files and symbolic
+   links are copied with their owner, group, mode and modification
+   time, the tmpfs's root taking those of the image's `/run`; FIFOs,
+   sockets and devices are not copied (the init logs how many). The
+   copy reads the disk through descriptors, one name at a time, and
+   follows no symbolic link. An entry `/run/gigahost` of the image is
+   not copied: that name is the init's (step 5). The copy is bounded: at
+   most 4096 entries, 16 MiB of file data and 32 directories deep; past
+   a bound, or on an error, it stops where it is with one log line
+   (`gigahost-init: copying the image's /run stopped after <n> entries:
+   <why>`) and the boot goes on. When the image's `/run` is a symbolic
+   link, nothing is copied and the tmpfs is mounted where it leads; when
+   it is missing, it is created (mode 0755) and the tmpfs starts empty.
+   (Since release 6.18.57-gh6, for every interface version, with or
+   without `init_system`.)
 5. Sets the host name. Writes `hosts`, `resolv.conf` and `hostname` into
    `/run/gigahost/` and bind-mounts each over `/etc/hosts`,
    `/etc/resolv.conf` and `/etc/hostname`. The mount covers the path
@@ -203,6 +237,16 @@ These are the run mode's steps; the unpack mode's follow.
 7. With `authorized_keys`: writes the keys, one per line, to the user's
    `~/.ssh/authorized_keys` (directory 0700, file 0600, both owned by the
    user and the user's primary group), replacing the file.
+
+   With version 5's `volumes`, for each path in order: when it exists
+   (as anything, a symbolic link too) it is left alone; else its missing
+   components are made directories, owned by root, mode 0755, as Docker
+   makes a volume path the image lacks. Each path is resolved inside the
+   root (`openat2` with `RESOLVE_IN_ROOT`), so a symbolic link on its way
+   leads somewhere inside the root, never out of it. A path that cannot
+   be made (a file on its way, a symbolic link to nothing) is logged by
+   its index (`gigahost-init: volume path N was not made: <reason>`) and
+   skipped; the boot goes on. The init logs how many paths it made.
 8. Starts the process as Docker does:
    - every signal at its default action and none blocked;
    - stdin is `/dev/null`; stdout and stderr go to `/dev/hvc0` in raw mode
@@ -236,8 +280,8 @@ These are the run mode's steps; the unpack mode's follow.
 What the init may create on the disk, when the image lacks it: the
 directories `/dev`, `/proc`, `/sys`, `/run` and `/etc`, empty
 `/etc/hosts`, `/etc/resolv.conf` and `/etc/hostname` files (as mount
-points), the working directory, and `~/.ssh/authorized_keys` for
-`authorized_keys`. Nothing else on the disk is written but by the process.
+points), the working directory, `~/.ssh/authorized_keys` for
+`authorized_keys`, and the directories of version 5's `volumes`. Nothing else on the disk is written but by the process.
 
 Any failure in these steps (an unknown version, a bad config, no disk, a
 user or `argv[0]` not found, a failed mount) ends in an `error` report and
@@ -365,7 +409,7 @@ manage devices (`/sys` is read-only). An image's init that expects
 virtual terminals (gettys on `tty1`…) finds none: images drop them
 (Alpine's `/etc/inittab` lines `tty1::respawn:...`, for example).
 
-## The unpack mode (versions 2 to 4)
+## The unpack mode (versions 2 to 5)
 
 For a new container instance the agent:
 
@@ -377,13 +421,13 @@ For a new container instance the agent:
    no padding, so layer *i* starts at the sum of the sizes before it. The
    disk may be longer (a tail to a whole block); the bytes past the last
    layer are ignored;
-3. boots once with `gh.v=2` (or `3`, `4`), the unpack config, the root disk as
+3. boots once with `gh.v=2` (or `3`, `4`, `5`), the unpack config, the root disk as
    `/dev/vda` and the layers disk as `/dev/vdb`, read-only (QEMU
    `readonly=on`, libvirt `<readonly/>`); the rest of the machine is as
    for a run boot;
 4. when the domain has ended and the last report is `unpacked`, detaches
    the layers disk and from then on boots the instance in the run mode
-   (version 1, or version 2, 3 or 4 with `"mode": "run"`). Any other end (an
+   (version 1, or version 2 to 5 with `"mode": "run"`). Any other end (an
    `error` report, no report, a timeout of its own) leaves a disk that
    is not to be used: the agent starts again from step 1.
 
@@ -565,7 +609,7 @@ serial log for lines starting with `gigahost-init: report `).
   - `reason`: `exited` (it ended by itself), `stopped` (it ended after a
     stop command, whatever its status), `error` (the init could not
     start it, or in the unpack mode could not unpack the layers; `code`
-    and `signal` are `null`), in the unpack mode (versions 2 to 4)
+    and `signal` are `null`), in the unpack mode (versions 2 to 5)
     `unpacked` (every layer is on the root disk; `code` 0) or, with
     version 3's `init_system`, `poweroff` or `reboot` (the image's init
     powered off, halted or rebooted; see The init system). An agent

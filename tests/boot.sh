@@ -96,15 +96,19 @@ mapfile -t image_layers <<< "${image_layers}"
 # tar_layer OUT SPEC...: a layer written as an image builder writes one,
 # owned by root, from SPECs: dir:PATH:MODE, file:PATH:MODE:TEXT,
 # link:PATH:TARGET, chr:PATH:MAJOR:MINOR, fifo:PATH (a whiteout is a
-# file named .wh.NAME).
+# file named .wh.NAME); owner:UID:GID owns the entries after it so.
 tar_layer() {
     python3 - "$@" << 'PYTHON'
 import io, sys, tarfile
+uid = gid = 0
 with tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT) as out:
     for spec in sys.argv[2:]:
         kind, path, *rest = spec.split(":", 3)
+        if kind == "owner":
+            uid, gid = int(path), int(rest[0])
+            continue
         info = tarfile.TarInfo(path)
-        info.uid = info.gid = 0
+        info.uid, info.gid = uid, gid
         info.mtime = 1700000000
         data = None
         if kind == "dir":
@@ -129,7 +133,9 @@ PYTHON
 # (a whiteout), so case 4 can show the init writes through none of them.
 # root's ~/.ssh/authorized_keys is a symbolic link to /etc/shadow, so case
 # 7 can show the keys replace the link instead of writing through it.
-# zstd-compressed, as the image's own layers are gzip.
+# Its /run/app, owned by nobody, holds a file, and /data has no vol, so
+# case 12 can show the process finds the image's /run and the volume
+# path. zstd-compressed, as the image's own layers are gzip.
 disk_hosts='# the disk'"'"'s own hosts file'
 resolv_link=../run/systemd/resolve/stub-resolv.conf
 tar_layer "${work}/fixture.tar" \
@@ -137,7 +143,11 @@ tar_layer "${work}/fixture.tar" \
     "file:etc/hosts:0644:${disk_hosts}"$'\n' \
     "link:etc/resolv.conf:${resolv_link}" \
     "dir:root/.ssh:0700" \
-    "link:root/.ssh/authorized_keys:/etc/shadow"
+    "link:root/.ssh/authorized_keys:/etc/shadow" \
+    "dir:data:0755" \
+    "owner:65534:65534" \
+    "dir:run/app:0750" \
+    "file:run/app/seed:0640:from-the-image"
 zstd -q -19 --rm "${work}/fixture.tar" -o "${work}/fixture.tar.zst"
 fixture=${work}/fixture.tar.zst:application/vnd.oci.image.layer.v1.tar+zstd
 layers_disk "${work}/layers.img" "${work}/unpack.json" "${image_layers[@]}" "${fixture}"
@@ -146,6 +156,7 @@ network='gh.ip4=10.115.0.15/24 gh.gw4=10.115.0.1 gh.ip6=fd15:115::15/64 gh.gw6=f
 default_cmdline="console=ttyS0 quiet gh.v=1 gh.hostname=case-host ${network}"
 v2_cmdline="console=ttyS0 quiet gh.v=2 gh.hostname=case-host ${network}"
 v3_cmdline="console=ttyS0 quiet gh.v=3 gh.hostname=case-host ${network}"
+v5_cmdline="console=ttyS0 quiet gh.v=5 gh.hostname=case-host ${network}"
 unpack_cmdline=${v2_cmdline}
 
 failures=0
@@ -548,7 +559,7 @@ expect_absent serial.log '"event":"started"'
 expect_absent hvc.log ran
 show_logs "${before}"
 before=${failures}
-boot cmdline-v5 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "console=ttyS0 quiet gh.v=5 gh.hostname=case-host ${network}"
+boot cmdline-v6 '{"version":1,"argv":["/bin/sh","-c","echo ran"]}' "console=ttyS0 quiet gh.v=6 gh.hostname=case-host ${network}"
 expect_report '"reason":"error","message":"gh.v names an interface version this init does not support"'
 expect_absent serial.log '"event":"started"'
 show_logs "${before}"
@@ -692,6 +703,39 @@ before=${failures}
 boot init-system-nobody '{"version":3,"argv":["/sbin/init"],"init_system":true,"user":"nobody"}' "${v3_cmdline}"
 expect_report "\"reason\":\"error\",\"message\":\"config field \`user\` is not root, which \`init_system\` requires\""
 expect_absent serial.log '"event":"started"'
+show_logs "${before}"
+
+# 12. The image's /run is the process's (seeded into the tmpfs, owners
+# and modes kept, writable, the disk's own unchanged), and version 5's
+# volumes: the missing /data/vol is made (root, 0755), the existing
+# /run/app left alone. volumes in a version-4 config is refused.
+before=${failures}
+config=$(cat << 'JSON'
+{"version":5,"user":"nobody","volumes":["/data/vol","/run/app"],
+ "argv":["/bin/sh","-c","stat -c 'RUN_APP=%u:%g:%a' /run/app; stat -c 'SEED=%u:%a' /run/app/seed; cat /run/app/seed; echo; echo new > /run/app/new && cat /run/app/new; stat -c 'VOL=%u:%g:%a' /data/vol; ls /run/gigahost"]}
+JSON
+)
+boot run-and-volumes "${config}" "${v5_cmdline}"
+expect_started 5
+tr -d '\r' < "${case_dir}/hvc.log" > "${case_dir}/console.txt"
+expect_line console.txt RUN_APP=65534:65534:750
+expect_line console.txt SEED=65534:640
+expect_line console.txt from-the-image
+expect_line console.txt new
+expect_line console.txt VOL=0:0:755
+expect_line console.txt hosts
+grep -a -q 'gigahost-init: made 1 missing volume path(s)' "${case_dir}/serial.log" \
+    || fail "no line saying the volume path was made"
+expect_absent serial.log "copying the image's /run stopped"
+expect_report '{"v":5,"event":"exited","code":0,"signal":null,"reason":"exited"}'
+debugfs -R 'stat /run/app/new' "${case_dir}/disk.img" 2>&1 | grep -q 'File not found' \
+    || fail "the process wrote the disk's /run"
+show_logs "${before}"
+before=${failures}
+boot volumes-v4 '{"version":4,"argv":["/bin/sh","-c","echo ran"],"volumes":["/data/vol"]}' "${v4_cmdline}"
+expect_report "\"v\":4,\"event\":\"exited\",\"code\":null,\"signal\":null,\"reason\":\"error\",\"message\":\"the config has an unknown field \`volumes\`\""
+expect_absent serial.log '"event":"started"'
+expect_absent hvc.log ran
 show_logs "${before}"
 
 # 11. Version 3's init_system: an image's own init system (systemd on

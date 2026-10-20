@@ -1,8 +1,8 @@
 //! The machine's configuration, read from `fw_cfg` (interface versions 1
-//! to 4): the process to run (from version 3, possibly the image's own
-//! init system), or (version 2's unpack mode) the image layers to unpack
-//! onto the root disk (from version 4, possibly a redeploy keeping some of
-//! its paths).
+//! to 5): the process to run (from version 3, possibly the image's own
+//! init system; from version 5 with the image's volume paths), or
+//! (version 2's unpack mode) the image layers to unpack onto the root disk
+//! (from version 4, possibly a redeploy keeping some of its paths).
 //!
 //! The config may carry secrets (environment values, keys), so no error
 //! message here quotes a value: they name the field at most.
@@ -28,7 +28,7 @@ const DEFAULT_STOP_SIGNAL: i32 = 15;
 pub const MAX_SIGNAL: i32 = 64;
 
 /// The config versions this init accepts.
-pub const VERSIONS: &[u64] = &[1, 2, 3, 4];
+pub const VERSIONS: &[u64] = &[1, 2, 3, 4, 5];
 
 /// The first config version with `init_system`.
 const INIT_SYSTEM_VERSION: u64 = 3;
@@ -36,10 +36,17 @@ const INIT_SYSTEM_VERSION: u64 = 3;
 /// The first config version with the unpack mode's `keep`.
 const KEEP_VERSION: u64 = 4;
 
+/// The first config version with the run mode's `volumes`.
+const VOLUMES_VERSION: u64 = 5;
+
+/// The most volume paths a run config may list.
+pub const MAX_VOLUMES: usize = 64;
+
 /// The most paths a redeploy may keep.
 pub const MAX_KEEP: usize = 64;
 
-/// The longest kept path, in bytes (Linux's `PATH_MAX` less its NUL).
+/// The longest kept path or volume path, in bytes (Linux's `PATH_MAX` less
+/// its NUL).
 pub const MAX_KEEP_BYTES: usize = 4095;
 
 /// The most layers an unpack config may list.
@@ -135,6 +142,11 @@ pub struct Config {
     /// own.
     #[serde(default)]
     pub init_system: bool,
+    /// Version 5's `volumes`: the image's `VOLUME` paths, each without its
+    /// leading `/` (`app/data` for `/app/data`), parsed apart from the
+    /// other fields.
+    #[serde(skip)]
+    pub volumes: Vec<Vec<u8>>,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +168,7 @@ impl std::fmt::Debug for Config {
                 &self.authorized_keys.as_ref().map(|keys| keys.keys.len()),
             )
             .field("init_system", &self.init_system)
+            .field("volumes", &self.volumes.len())
             .finish_non_exhaustive()
     }
 }
@@ -182,12 +195,15 @@ const FIELDS: &[&str] = &[
     "stop_signal",
     "authorized_keys",
     "init_system",
+    "volumes",
 ];
 
 /// Whether `key` is a run field of config `version`: `init_system` is
-/// version 3's, unknown to versions 1 and 2.
+/// version 3's, unknown to versions 1 and 2, and `volumes` version 5's.
 fn known_field(key: &str, version: u64) -> bool {
-    FIELDS.contains(&key) && (key != "init_system" || version >= INIT_SYSTEM_VERSION)
+    FIELDS.contains(&key)
+        && (key != "init_system" || version >= INIT_SYSTEM_VERSION)
+        && (key != "volumes" || version >= VOLUMES_VERSION)
 }
 
 /// Names what in `value` keeps it from parsing, without quoting a value.
@@ -288,7 +304,7 @@ pub fn parse(bytes: &[u8], boot_version: u32) -> Result<Boot, String> {
         Some(_) => return Err("the config's version is not one this init supports".into()),
     };
     if version == 1 {
-        return run_config(&value, version).map(Boot::Run);
+        return run_config(&mut value, version).map(Boot::Run);
     }
     let Some(object) = value.as_object_mut() else {
         return Err("the config is not a JSON object".into());
@@ -305,17 +321,26 @@ pub fn parse(bytes: &[u8], boot_version: u32) -> Result<Boot, String> {
     if object.contains_key("layers") {
         return Err("config field `layers` is taken in the unpack mode only".into());
     }
-    run_config(&value, version).map(Boot::Run)
+    run_config(&mut value, version).map(Boot::Run)
 }
 
-/// The run mode's config, as version 1 has it.
-fn run_config(value: &Value, version: u64) -> Result<Config, String> {
-    if version < INIT_SYSTEM_VERSION && value.get("init_system").is_some() {
+/// The run mode's config, as version 1 has it; from version 5 with
+/// `volumes`, which is taken out of `value` and parsed apart.
+fn run_config(value: &mut Value, version: u64) -> Result<Config, String> {
+    if (version < INIT_SYSTEM_VERSION && value.get("init_system").is_some())
+        || (version < VOLUMES_VERSION && value.get("volumes").is_some())
+    {
         // Not a field of this version: refused as any unknown field.
         return Err(diagnose(value, version));
     }
-    let config = Config::deserialize(value).map_err(|_| diagnose(value, version))?;
+    let volumes = value
+        .as_object_mut()
+        .and_then(|object| object.remove("volumes"));
+    let mut config = Config::deserialize(&*value).map_err(|_| diagnose(value, version))?;
     check(&config)?;
+    if let Some(volumes) = volumes {
+        config.volumes = paths(&volumes, "volumes", MAX_VOLUMES)?;
+    }
     Ok(config)
 }
 
@@ -358,29 +383,33 @@ fn unpack_config(object: &serde_json::Map<String, Value>, version: u64) -> Resul
             .ok_or_else(|| format!("config field `layers` entry {index} ends beyond any disk"))?;
         checked.push(layer);
     }
-    let keep = object.get("keep").map(keep_paths).transpose()?;
+    let keep = object
+        .get("keep")
+        .map(|keep| paths(keep, "keep", MAX_KEEP))
+        .transpose()?;
     Ok(Unpack {
         layers: checked,
         keep,
     })
 }
 
-/// Version 4's `keep`: 0 to [`MAX_KEEP`] absolute, normalised paths (no
-/// `.`, `..` or empty component, no trailing slash, not `/` itself), each
-/// at most [`MAX_KEEP_BYTES`] bytes, none twice. Each is returned without
-/// its leading `/`.
-fn keep_paths(value: &Value) -> Result<Vec<Vec<u8>>, String> {
+/// Version 4's `keep` and version 5's `volumes`, the config field
+/// `field`: 0 to `max` absolute, normalised paths (no `.`, `..` or empty
+/// component, no trailing slash, not `/` itself), each at most
+/// [`MAX_KEEP_BYTES`] bytes, none twice. Each is returned without its
+/// leading `/`.
+fn paths(value: &Value, field: &str, max: usize) -> Result<Vec<Vec<u8>>, String> {
     let Some(entries) = value.as_array() else {
-        return Err("config field `keep` is not a list".into());
+        return Err(format!("config field `{field}` is not a list"));
     };
-    if entries.len() > MAX_KEEP {
+    if entries.len() > max {
         return Err(format!(
-            "config field `keep` holds more than {MAX_KEEP} paths"
+            "config field `{field}` holds more than {max} paths"
         ));
     }
     let mut paths: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let what = |problem: &str| format!("config field `keep` entry {index} {problem}");
+        let what = |problem: &str| format!("config field `{field}` entry {index} {problem}");
         let Some(text) = entry.as_str() else {
             return Err(what("is not a string"));
         };
@@ -875,6 +904,145 @@ mod tests {
         );
         assert_eq!(
             parse_boot(r#"{"version": 3, "argv": ["a"]}"#, 4).unwrap_err(),
+            "the config's version is not the boot's interface version (gh.v)"
+        );
+    }
+
+    /// A version-5 run config with `volumes` set to the JSON `volumes`.
+    fn volumes(volumes: &str) -> Result<Vec<Vec<u8>>, String> {
+        let text = format!(r#"{{"version": 5, "argv": ["a"]{volumes}}}"#);
+        match parse_boot(&text, 5)? {
+            Boot::Run(config) => Ok(config.volumes),
+            Boot::Unpack(_) => panic!("not the run mode"),
+        }
+    }
+
+    #[test]
+    fn version_five_volumes() {
+        assert_eq!(volumes("").unwrap(), Vec::<Vec<u8>>::new());
+        assert_eq!(
+            volumes(r#", "volumes": []"#).unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(
+            volumes(r#", "volumes": ["/app/data", "/var/lib/mysql", "/a b/ü"]"#).unwrap(),
+            vec![
+                b"app/data".to_vec(),
+                b"var/lib/mysql".to_vec(),
+                "a b/ü".as_bytes().to_vec()
+            ]
+        );
+        let longest = format!("/{}", "a".repeat(MAX_KEEP_BYTES - 1));
+        assert_eq!(
+            volumes(&format!(r#", "volumes": ["{longest}"]"#)).unwrap(),
+            vec![longest.as_bytes()[1..].to_vec()]
+        );
+        let many: Vec<String> = (0..MAX_VOLUMES).map(|n| format!(r#""/p{n}""#)).collect();
+        assert_eq!(
+            volumes(&format!(r#", "volumes": [{}]"#, many.join(",")))
+                .unwrap()
+                .len(),
+            MAX_VOLUMES
+        );
+        let too_many: Vec<String> = (0..=MAX_VOLUMES).map(|n| format!(r#""/p{n}""#)).collect();
+        assert_eq!(
+            volumes(&format!(r#", "volumes": [{}]"#, too_many.join(","))).unwrap_err(),
+            "config field `volumes` holds more than 64 paths"
+        );
+        assert_eq!(
+            volumes(&format!(
+                r#", "volumes": ["/{}"]"#,
+                "a".repeat(MAX_KEEP_BYTES)
+            ))
+            .unwrap_err(),
+            "config field `volumes` entry 0 is longer than 4095 bytes"
+        );
+        for (value, problem) in [
+            (r#""/""#, "is the root"),
+            (r#""data""#, "is not an absolute path"),
+            (r#""/data/""#, "is not a normalised path"),
+            (r#""/data/../etc""#, "is not a normalised path"),
+            (r#""/./data""#, "is not a normalised path"),
+            (r#""/a\u0000b""#, "holds a NUL byte"),
+            ("1", "is not a string"),
+        ] {
+            assert_eq!(
+                volumes(&format!(r#", "volumes": ["/ok", {value}]"#)).unwrap_err(),
+                format!("config field `volumes` entry 1 {problem}"),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            volumes(r#", "volumes": ["/data", "/data"]"#).unwrap_err(),
+            "config field `volumes` entry 1 is given twice"
+        );
+        assert_eq!(
+            volumes(r#", "volumes": "/data""#).unwrap_err(),
+            "config field `volumes` is not a list"
+        );
+        // With the other fields of version 4, init_system among them.
+        let Boot::Run(config) = parse_boot(
+            r#"{"version": 5, "mode": "run", "argv": ["/sbin/init"], "init_system": true, "volumes": ["/srv"]}"#,
+            5,
+        )
+        .unwrap() else {
+            panic!("not the run mode")
+        };
+        assert!(config.init_system);
+        assert_eq!(config.volumes, [b"srv".to_vec()]);
+        // A bad other field is named as before.
+        assert_eq!(
+            parse_boot(r#"{"version": 5, "argv": 5, "volumes": []}"#, 5).unwrap_err(),
+            "config field `argv` is not a list of strings"
+        );
+    }
+
+    #[test]
+    fn volumes_unknown_before_version_five() {
+        for version in 1..=4u32 {
+            let text = format!(r#"{{"version": {version}, "argv": ["a"], "volumes": ["/data"]}}"#);
+            assert_eq!(
+                parse_boot(&text, version).unwrap_err(),
+                "the config has an unknown field `volumes`",
+                "{version}"
+            );
+        }
+        // Not a field of the unpack mode, nor keep of the run mode.
+        let text = format!(
+            r#"{{"version": 5, "mode": "unpack", "volumes": [], "layers": [{}]}}"#,
+            layer_json(TAR, DIGEST, "1")
+        );
+        assert_eq!(
+            parse_boot(&text, 5).unwrap_err(),
+            "config field `volumes` is not taken in the unpack mode"
+        );
+        let text = format!(
+            r#"{{"version": 4, "mode": "unpack", "volumes": [], "layers": [{}]}}"#,
+            layer_json(TAR, DIGEST, "1")
+        );
+        assert_eq!(
+            parse_boot(&text, 4).unwrap_err(),
+            "the config has an unknown field `volumes`"
+        );
+        assert_eq!(
+            parse_boot(r#"{"version": 5, "argv": ["a"], "keep": []}"#, 5).unwrap_err(),
+            "the config has an unknown field `keep`"
+        );
+        // Version 5's unpack mode is version 4's, keep included.
+        let text = format!(
+            r#"{{"version": 5, "mode": "unpack", "keep": ["/data"], "layers": [{}]}}"#,
+            layer_json(TAR, DIGEST, "1")
+        );
+        let Boot::Unpack(unpack) = parse_boot(&text, 5).unwrap() else {
+            panic!("not the unpack mode")
+        };
+        assert_eq!(unpack.keep, Some(vec![b"data".to_vec()]));
+        assert_eq!(
+            parse_boot(r#"{"version": 5, "argv": ["a"]}"#, 4).unwrap_err(),
+            "the config's version is not one this init supports"
+        );
+        assert_eq!(
+            parse_boot(r#"{"version": 4, "argv": ["a"]}"#, 5).unwrap_err(),
             "the config's version is not the boot's interface version (gh.v)"
         );
     }

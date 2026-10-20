@@ -1,7 +1,8 @@
 //! File system calls relative to directory descriptors, for the unpack
-//! mode: every path the unpack resolves goes through [`openat2`] with
-//! `RESOLVE_IN_ROOT`, and every change is made with an `*at` call on the
-//! resolved parent and a single name.
+//! mode, the copy of the image's `/run` and the volume directories: every
+//! path resolved goes through `openat2` with `RESOLVE_IN_ROOT`, and every
+//! change is made with an `*at` call on the resolved parent and a single
+//! name.
 
 use super::{check, errno};
 use std::ffi::{CStr, CString};
@@ -14,6 +15,11 @@ use std::ptr::NonNull;
 /// are refused and no mount is crossed.
 pub const RESOLVE_INSIDE: u64 =
     libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV;
+
+/// `RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS`: as [`RESOLVE_INSIDE`], but
+/// crossing the mounts inside the directory (the running root's `/run`,
+/// `/dev`).
+pub const RESOLVE_IN_ROOT: u64 = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
 
 /// `setxattrat(2)`, Linux 6.13, x86-64; not every libc release names it.
 const SYS_SETXATTRAT: libc::c_long = 463;
@@ -41,6 +47,12 @@ pub struct Stat {
     pub mode: u32,
     pub dev: u64,
     pub ino: u64,
+    pub uid: u32,
+    pub gid: u32,
+    /// `st_size`: a regular file's length in bytes.
+    pub size: u64,
+    /// The modification time: seconds and nanoseconds.
+    pub mtime: (i64, u32),
 }
 
 impl Stat {
@@ -50,6 +62,10 @@ impl Stat {
 
     pub fn is_symlink(&self) -> bool {
         self.mode & libc::S_IFMT == libc::S_IFLNK
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFREG
     }
 }
 
@@ -63,10 +79,25 @@ fn owned(rc: libc::c_int) -> io::Result<OwnedFd> {
 /// `openat2(dir, path, flags, RESOLVE_INSIDE)`: `path` is resolved with
 /// `dir` as its root.
 pub fn open_inside(dir: BorrowedFd<'_>, path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    openat2(dir, path, flags, RESOLVE_INSIDE)
+}
+
+/// `openat2(dir, path, flags, RESOLVE_IN_ROOT)`: `path` is resolved with
+/// `dir` as its root, mounts inside it crossed.
+pub fn open_in_root(dir: BorrowedFd<'_>, path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    openat2(dir, path, flags, RESOLVE_IN_ROOT)
+}
+
+fn openat2(
+    dir: BorrowedFd<'_>,
+    path: &CStr,
+    flags: libc::c_int,
+    resolve: u64,
+) -> io::Result<OwnedFd> {
     let how = OpenHow {
         flags: u64::try_from(flags | libc::O_CLOEXEC).unwrap_or(0),
         mode: 0,
-        resolve: RESOLVE_INSIDE,
+        resolve,
     };
     // SAFETY: `path` is a valid C string and `how` a valid open_how of the
     // size passed; the call returns a new descriptor or -1.
@@ -117,7 +148,40 @@ pub fn stat_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<Stat> {
         mode: stat.st_mode,
         dev: stat.st_dev,
         ino: stat.st_ino,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        size: u64::try_from(stat.st_size).unwrap_or(0),
+        mtime: (
+            stat.st_mtime,
+            u32::try_from(stat.st_mtime_nsec).unwrap_or(0),
+        ),
     })
+}
+
+/// The longest symbolic link target [`read_link_at`] reads, in bytes
+/// (Linux's `PATH_MAX` less its NUL).
+pub const MAX_LINK_BYTES: usize = 4095;
+
+/// The target of the symbolic link `name` in `dir`, as written; a target
+/// longer than [`MAX_LINK_BYTES`] is `ENAMETOOLONG`.
+pub fn read_link_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<Vec<u8>> {
+    let mut target = vec![0u8; MAX_LINK_BYTES + 1];
+    // SAFETY: `name` is a valid C string; the pointer and length describe
+    // the live buffer `target`.
+    let size = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            target.as_mut_ptr().cast(),
+            target.len(),
+        )
+    };
+    let size = usize::try_from(size).map_err(|_| errno())?;
+    if size > MAX_LINK_BYTES {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    target.truncate(size);
+    Ok(target)
 }
 
 pub fn mkdir_at(dir: BorrowedFd<'_>, name: &CStr, mode: u32) -> io::Result<()> {

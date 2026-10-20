@@ -9,7 +9,7 @@ under a container runtime.
 
 - [docs/interface.md](docs/interface.md): the contract between the host
   that boots a container machine and the init (interface versions 1 to
-  4): the kernel command line, the config, the reports and the stop
+  5): the kernel command line, the config, the reports and the stop
   command.
 - [docs/building.md](docs/building.md): how a release is built
   reproducibly, how to verify one, the boot tests, and where the kernel

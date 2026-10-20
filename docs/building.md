@@ -11,7 +11,7 @@ A release is four files and their checksums, in `out/<RELEASE>/`:
 | `SHA256SUMS` | sha256 of the four files above. |
 
 The release name, `RELEASE`, is the kernel version, `-gh` and our build
-number (`6.18.57-gh5`); a release's tag is `v<RELEASE>`.
+number (`6.18.57-gh6`); a release's tag is `v<RELEASE>`.
 
 ## Build
 
@@ -108,6 +108,8 @@ the user, working directory and environment, the hosts, resolv.conf and
 host name (and that the disk's own files are untouched), refused configs
 and command lines, where the output goes, the SSH keys (which replace a
 symbolic link rather than write through it), the process's signal state,
+the image's `/run` seen by a process of another user (owners and modes
+kept, writable, the disk's own unchanged) and version 5's volume paths,
 and that a kernel panic or a reboot by the process ends the machine; and
 version 3's init systems: two images built from `tests/init-systems/`
 (Debian with systemd, Alpine with busybox init running OpenRC), unpacked
