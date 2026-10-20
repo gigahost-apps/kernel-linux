@@ -712,7 +712,7 @@ show_logs "${before}"
 before=${failures}
 config=$(cat << 'JSON'
 {"version":5,"user":"nobody","volumes":["/data/vol","/run/app"],
- "argv":["/bin/sh","-c","stat -c 'RUN_APP=%u:%g:%a' /run/app; stat -c 'SEED=%u:%a' /run/app/seed; cat /run/app/seed; echo; echo new > /run/app/new && cat /run/app/new; stat -c 'VOL=%u:%g:%a' /data/vol; ls /run/gigahost"]}
+ "argv":["/bin/sh","-c","stat -c 'RUN_APP=%u:%g:%a' /run/app; stat -c 'SEED=%u:%a' /run/app/seed; cat /run/app/seed; echo; echo new > /run/app/new && cat /run/app/new; stat -c 'VOL=%u:%g:%a' /data/vol; test -f /run/gigahost/hosts && echo OURS"]}
 JSON
 )
 boot run-and-volumes "${config}" "${v5_cmdline}"
@@ -723,7 +723,7 @@ expect_line console.txt SEED=65534:640
 expect_line console.txt from-the-image
 expect_line console.txt new
 expect_line console.txt VOL=0:0:755
-expect_line console.txt hosts
+expect_line console.txt OURS
 grep -a -q 'gigahost-init: made 1 missing volume path(s)' "${case_dir}/serial.log" \
     || fail "no line saying the volume path was made"
 expect_absent serial.log "copying the image's /run stopped"
