@@ -34,8 +34,11 @@ process starts when the image lacks them, as Docker makes a volume's
 mount point. A boot of an earlier version behaves exactly as before; a
 version-5 boot is version 4's in everything else.
 
-In every version, the run mode's `/run` starts as a copy of the image's
-own `/run` (step 4 below; since release 6.18.57-gh6).
+In every version, since release 6.18.57-gh6, the run mode's `/run`
+starts as a copy of the image's own `/run` (step 4 below), and the run
+mode's process is PID 1 of PID, mount and cgroup namespaces of its own
+(step 8 below), as Docker runs every container's entrypoint (an image
+such as s6-overlay's refuses to run as any other PID).
 
 ## The machine
 
@@ -60,14 +63,16 @@ kernel boot (QEMU `-kernel`, `-initrd`, `-append`, or libvirt's `<kernel>`,
 
 The init powers the machine off when the container ends, so the agent sees
 the domain stop by itself. The kernel resets the machine at once on a
-panic (`CONFIG_PANIC_TIMEOUT=-1`), and the process, which runs as root
-by default, can reboot or power the machine off itself; with the reset
-ending the domain, each of these ends it too, without an `exited` report.
-A halt by the process (`reboot(2)` with `RB_HALT_SYSTEM`) stops the
-CPUs without ending the domain; the agent's stop ends it then (see
-Trust). With version 3's `init_system`, `reboot(2)` from the image ends
-only the image's PID namespace: the init reports it (`poweroff` or
-`reboot`) and powers the machine off (see The init system). The domain's end is therefore the event the agent acts on; the
+panic (`CONFIG_PANIC_TIMEOUT=-1`); with the reset ending the domain, a
+panic ends it too, without an `exited` report. The process, which runs
+as root by default, runs in a PID namespace of its own (since release
+6.18.57-gh6, in every mode), so `reboot(2)` from it ends only that
+namespace: the init reports the end (with version 3's `init_system`
+as `poweroff` or `reboot`, see The init system; else as `exited` by
+signal 2 or 1) and powers the machine off. Before release 6.18.57-gh6
+a run-mode process's `reboot(2)` rebooted or powered off the machine
+without a report, and a halt stopped the CPUs until the agent's stop.
+The domain's end is therefore the event the agent acts on; the
 reports (below) say why it ended when the init could say so.
 
 ## Kernel command line
@@ -211,7 +216,8 @@ These are the run mode's steps; the unpack mode's follow.
    image's `/run`, never from what an earlier boot left (the disk's
    `/run` is never written). Directories, regular files and symbolic
    links are copied with their owner, group, mode and modification
-   time, the tmpfs's root taking those of the image's `/run`; FIFOs,
+   time, the tmpfs's root taking those of the image's `/run` (even
+   when the copy stops early); FIFOs,
    sockets and devices are not copied (the init logs how many). The
    copy reads the disk through descriptors, one name at a time, and
    follows no symbolic link. An entry `/run/gigahost` of the image is
@@ -245,8 +251,23 @@ These are the run mode's steps; the unpack mode's follow.
    leads somewhere inside the root, never out of it. A path that cannot
    be made (a file on its way, a symbolic link to nothing) is logged by
    its index (`gigahost-init: volume path N was not made: <reason>`) and
-   skipped; the boot goes on. The init logs how many paths it made.
+   skipped; the boot goes on. So is a path in `/proc`, `/sys` or `/dev`
+   (its first component `proc`, `sys` or `dev`): those are the init's
+   mounts, not the image's. The init logs how many paths it made.
 8. Starts the process as Docker does:
+   - as PID 1 of PID, mount and cgroup namespaces of its own, set up as
+     for an init system (The init system below, its steps 1–4: the
+     `payload` cgroup, a `/proc` of the namespace, `/sys` read-only, a
+     cgroup2 of the namespace's root on `/sys/fs/cgroup`, hvc0 on
+     `/dev/console`, no `CAP_SYS_MODULE`; since release 6.18.57-gh6, in
+     every interface version). `$$` of a shell entrypoint is 1 and
+     `/proc/1` is the process; it sees no process of the init. As PID 1
+     of its namespace it reaps the orphans of its namespace (an image
+     whose process does not would gather zombies, as under Docker
+     without `--init`), and the kernel delivers to it, from outside,
+     only the signals it has a handler for (and SIGKILL): a process that
+     does not handle its stop signal ends by the stop's SIGKILL after
+     the timeout, as under `docker stop`;
    - every signal at its default action and none blocked;
    - stdin is `/dev/null`; stdout and stderr go to `/dev/hvc0` in raw mode
      (byte for byte, no `\r` added), or to the serial console without hvc0;
@@ -272,7 +293,8 @@ These are the run mode's steps; the unpack mode's follow.
 
    With version 3's `init_system`, step 8 starts the image's init system
    instead, as The init system (below) describes.
-9. Reaps every process. When the main process ends, or on a stop command
+9. Reaps its own children. When the main process ends (the kernel then
+   ends every other process of its namespace), or on a stop command
    (below): SIGTERM to every other process, 2 s, SIGKILL to all; then the
    one `exited` report; sync; the root remounted read-only; power-off.
 
@@ -293,7 +315,9 @@ With `"init_system": true` the init stays PID 1 of the machine (its
 reports, the control listener, the stop and the power-off are as for a
 process) and runs the image's init as PID 1 of a PID namespace of its
 own, the way systemd-nspawn, and Docker or Podman with a private cgroup
-namespace, run an init system. After steps 1–7, instead of step 8:
+namespace, run an init system. After steps 1–7, instead of step 8 (whose
+process starts in the same namespaces, steps 1–4 here, since release
+6.18.57-gh6):
 
 1. **cgroups**: the init creates the cgroup `/sys/fs/cgroup/payload` and
    enables every controller the kernel offers (`cgroup.controllers` of
@@ -598,8 +622,9 @@ serial log for lines starting with `gigahost-init: report `).
 ```
 
 - `started`: the process is running; `pid` is its PID in the guest
-  (with `init_system`, the image's init's PID in the machine's PID
-  namespace; inside its own it is 1), `monotonic_ms` the guest's
+  (its PID in the machine's PID namespace; inside its own it is 1,
+  since release 6.18.57-gh6 in every mode, before it with `init_system`
+  only), `monotonic_ms` the guest's
   monotonic clock at that moment.
 - `exited`, at most once per boot, and the last report when it comes
   (a panic, or a reboot or power-off by the process, ends the machine
@@ -642,7 +667,10 @@ absent) and capped at 300. The init answers one line:
 - On `stop`: the config's `stop_signal` (SIGTERM by default) to the main
   process. When it has not ended after the timeout: SIGTERM to every
   process, 2 s, SIGKILL to every process. The end is then step 9; the
-  `exited` report says `stopped`.
+  `exited` report says `stopped`. The main process is PID 1 of its PID
+  namespace, so a signal it has no handler for does nothing to it (as
+  under Docker): one that does not handle its stop signal ends by the
+  SIGKILL.
 - A second stop, or a stop after the process ended, is answered `ok` and
   changes nothing. A stop racing the process's own exit still gives
   exactly one `exited` report.

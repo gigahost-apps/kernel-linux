@@ -500,9 +500,24 @@ boot exit-3-v2 '{"version":2,"mode":"run","argv":["/bin/sh","-c","exit 3"]}' "${
 expect_started 2
 expect_report '{"v":2,"event":"exited","code":3,"signal":null,"reason":"exited"}'
 show_logs "${before}"
+
+# 2a. The process is PID 1 of a PID namespace of its own, as under
+# Docker: $$ is 1, /proc/1 is the process, it sees no other process
+# (the glob is the shell's own, with no child running), and the kernel
+# drops its own SIGKILL to itself, so it goes on to its exit code. A
+# version-1 boot, so every interface version has it.
 before=${failures}
-boot kill-9 '{"version":1,"argv":["/bin/sh","-c","kill -9 $$"]}'
-expect_report '"code":null,"signal":9,"reason":"exited"'
+config=$(cat << 'JSON'
+{"version":1,"argv":["/bin/sh","-c","[ \"$$\" = 1 ] && echo PID_ONE; head -c 7 /proc/1/cmdline; echo; set -- /proc/[0-9]*; echo \"PROCS=$#\"; kill -9 $$; exit 7"]}
+JSON
+)
+boot pid-one "${config}"
+expect_started
+tr -d '\r' < "${case_dir}/hvc.log" > "${case_dir}/console.txt"
+expect_line console.txt PID_ONE
+expect_line console.txt /bin/sh
+expect_line console.txt PROCS=1
+expect_report '{"v":1,"event":"exited","code":7,"signal":null,"reason":"exited"}'
 show_logs "${before}"
 
 # 3. The user, a working directory that is created, the environment; the
@@ -611,9 +626,10 @@ expect_absent hvc.log 'Broken pipe'
 expect_report '"code":0,"signal":null,"reason":"exited"'
 show_logs "${before}"
 
-# 9. A kernel panic and a reboot by the process end the machine at once
-# (the panic resets it, -no-reboot ends QEMU on a reset), without an exited
-# report.
+# 9. A kernel panic ends the machine at once (the panic resets it,
+# -no-reboot ends QEMU on a reset), without an exited report. A reboot or
+# a power-off by the process ends only its PID namespace: the kernel kills
+# the process by SIGHUP or SIGINT, which the report carries.
 before=${failures}
 boot panic '{"version":1,"argv":["/bin/sh","-c","echo c > /proc/sysrq-trigger"]}'
 grep -a -q 'Kernel panic - not syncing' "${case_dir}/serial.log" || fail "no kernel panic on the serial console"
@@ -621,7 +637,11 @@ expect_no_report
 show_logs "${before}"
 before=${failures}
 boot reboot '{"version":1,"argv":["/bin/sh","-c","reboot -f"]}'
-expect_no_report
+expect_report '{"v":1,"event":"exited","code":null,"signal":1,"reason":"exited"}'
+show_logs "${before}"
+before=${failures}
+boot poweroff '{"version":1,"argv":["/bin/sh","-c","poweroff -f"]}'
+expect_report '{"v":1,"event":"exited","code":null,"signal":2,"reason":"exited"}'
 show_logs "${before}"
 
 # 10a. A disk larger than its ext4 file system (a disk made or resized

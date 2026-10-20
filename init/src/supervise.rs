@@ -104,8 +104,13 @@ fn reason(ended: Ended, stop_requested: bool, init_system: bool) -> Reason {
 /// Reaps every child until the main process ends, then ends the machine.
 /// A stop sends `stop_signal` to `main` first and waits
 /// `default_timeout_seconds` unless the command gives a timeout.
-/// `init_system`: `main` is the image's init in a PID namespace of its
-/// own (version 3), whose power-off and reboot are reported as such.
+/// `main` is PID 1 of a PID namespace of its own in every mode; with
+/// `init_system` (version 3) it is the image's init, whose power-off and
+/// reboot are reported as such. When it ends the kernel ends every
+/// process of its namespace; the orphans inside are its to reap, this
+/// init reaps its own children. A stop signal `main` has no handler for
+/// does nothing to it (the kernel drops it for a namespace's init), so
+/// such a process is killed after the timeout, as under Docker.
 pub fn run(
     main: i32,
     listener: Option<vsock::Listener>,

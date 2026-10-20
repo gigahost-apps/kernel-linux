@@ -27,7 +27,7 @@ pub const DISK: &str = "/dev/vda";
 const DISK_WAIT: Duration = Duration::from_secs(5);
 const OUR_FILES: &str = "/run/gigahost";
 
-/// The cgroup an init system's cgroup namespace starts at (version 3).
+/// The cgroup the process's cgroup namespace starts at.
 const PAYLOAD_CGROUP: &str = "/sys/fs/cgroup/payload";
 
 /// What the image's init system reads to know it runs in a container,
@@ -449,8 +449,8 @@ fn write_authorized_keys(keys: &config::AuthorizedKeys) -> Result<(), String> {
     Ok(())
 }
 
-/// Version 3's `init_system`: the payload cgroup, with every controller
-/// the kernel offers enabled for it. The init stays in the root cgroup,
+/// The payload cgroup the process's cgroup namespace starts at, with
+/// every controller the kernel offers enabled for it. The init stays in the root cgroup,
 /// which cgroup v2's no-internal-process rule exempts.
 fn payload_cgroup() -> Result<(), String> {
     create_dir(PAYLOAD_CGROUP, 0o755)
@@ -467,9 +467,21 @@ fn payload_cgroup() -> Result<(), String> {
     Ok(())
 }
 
+/// Where the process starts, in every mode: as Docker starts a
+/// container's entrypoint, PID 1 of PID, mount and cgroup namespaces of
+/// its own, the cgroup namespace's root the payload cgroup, `output`
+/// bound over `/dev/console` inside when it is the hypervisor console.
+fn namespace(output: &str) -> Result<process::Namespace, String> {
+    let path = |text: &str| sys::cstring(text).map_err(|_| "a path holds a NUL byte".to_owned());
+    Ok(process::Namespace {
+        cgroup_procs: path(&format!("{PAYLOAD_CGROUP}/cgroup.procs"))?,
+        console: (output == "/dev/hvc0").then(|| path(output)).transpose()?,
+    })
+}
+
 /// Step 8: the process, as Docker starts it, or (version 3's
-/// `init_system`) the image's init in namespaces of its own. Returns its
-/// PID.
+/// `init_system`) the image's init; either is PID 1 of namespaces of its
+/// own ([`namespace`]). Returns its PID here.
 fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
     let (passwd, groups) = read_accounts();
     let ExecUser {
@@ -526,15 +538,8 @@ fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
         (uid, gid, &groups),
     )
     .map_err(|_| "the command, environment or working directory holds a NUL byte".to_owned())?;
-    if config.init_system {
-        payload_cgroup()?;
-        let path =
-            |text: &str| sys::cstring(text).map_err(|_| "a path holds a NUL byte".to_owned());
-        spawn.namespace = Some(process::Namespace {
-            cgroup_procs: path(&format!("{PAYLOAD_CGROUP}/cgroup.procs"))?,
-            console: (output == "/dev/hvc0").then(|| path(output)).transpose()?,
-        });
-    }
+    payload_cgroup()?;
+    spawn.namespace = Some(namespace(output)?);
     process::spawn(&spawn).map_err(|error| match error {
         process::SpawnError::Parent(error) => format!("starting the process failed: {error}"),
         process::SpawnError::Child(stage, error) => {
@@ -544,8 +549,8 @@ fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
                 process::Stage::Identity => "switching to the user",
                 process::Stage::Exec if config.init_system => "executing the image's init",
                 process::Stage::Exec => "executing the command",
-                process::Stage::Namespace => "entering the init system's namespaces",
-                process::Stage::Mounts => "mounting the init system's namespace",
+                process::Stage::Namespace => "entering the process's namespaces",
+                process::Stage::Mounts => "mounting the process's namespace",
             };
             format!("{what} failed: {error}")
         }
@@ -567,5 +572,19 @@ mod tests {
         assert!(in_prefix6("2001:db8::1".parse().unwrap(), net6, 64));
         assert!(!in_prefix6("2001:db9::1".parse().unwrap(), net6, 64));
         assert!(!in_prefix6("2001:db8::1".parse().unwrap(), net6, 128));
+    }
+
+    /// The run mode and `init_system` start in the same namespaces; the
+    /// console is bound inside only when it is the hypervisor console.
+    #[test]
+    fn every_mode_starts_in_a_namespace() {
+        let hvc = namespace("/dev/hvc0").unwrap();
+        assert_eq!(
+            hvc.cgroup_procs.to_bytes(),
+            b"/sys/fs/cgroup/payload/cgroup.procs"
+        );
+        assert_eq!(hvc.console.unwrap().to_bytes(), b"/dev/hvc0");
+        let console = namespace("/dev/console").unwrap();
+        assert!(console.console.is_none());
     }
 }

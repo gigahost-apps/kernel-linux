@@ -16,12 +16,13 @@ pub struct Spawn {
     pub uid: u32,
     pub gid: u32,
     pub groups: Vec<u32>,
-    /// Version 3's `init_system`: start the program as PID 1 of PID,
-    /// mount and cgroup namespaces of its own.
+    /// Start the program as PID 1 of PID, mount and cgroup namespaces of
+    /// its own, as the init starts every mode's process (the run mode's
+    /// and `init_system`'s); `None` starts it as a plain child.
     pub namespace: Option<Namespace>,
 }
 
-/// Where an init system's namespaces start.
+/// Where the process's namespaces start.
 pub struct Namespace {
     /// The `cgroup.procs` of the cgroup that becomes the cgroup
     /// namespace's root.
@@ -135,9 +136,9 @@ pub fn spawn(spec: &Spawn) -> Result<i32, SpawnError> {
     // SAFETY: `fds` has room for the two descriptors pipe2 writes.
     check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }).map_err(SpawnError::Parent)?;
     let [read_end, write_end] = fds;
-    // An init system's gate: its PID 1 waits for the end of file, which
+    // The namespace's gate: its PID 1 waits for the end of file, which
     // comes once this init has reaped the first child and closed the
-    // write end, so the image's init never runs while the first child is
+    // write end, so the process never runs while the first child is
     // still in the cgroup.
     let gate = if spec.namespace.is_some() {
         let mut gate = [0 as libc::c_int; 2];
@@ -203,7 +204,7 @@ fn namespace_result(
 ) -> Result<i32, SpawnError> {
     // The first child exits once it has forked (or failed), its message
     // already in the pipe; reaping it makes the process this init's child,
-    // and its exit has taken it out of the cgroup: the image's init may go
+    // and its exit has taken it out of the cgroup: the process may go
     // on. Reaped before the read, so a first child killed before it wrote
     // cannot leave the read waiting on a PID 1 that waits on the gate.
     reap(first);
@@ -272,7 +273,7 @@ fn fail_child(report: libc::c_int, stage: Stage) -> ! {
     }
 }
 
-/// The first child of an init system's start: into the cgroup, out of
+/// The first child of a start in namespaces: into the cgroup, out of
 /// the namespaces, the fork of their PID 1, whose PID it sends before it
 /// exits. Their PID 1 first waits for the end of file on `gate`. Never
 /// returns.
@@ -312,7 +313,7 @@ fn namespace_parent(
                 fail_child(report, Stage::Mounts);
             }
             // The kernel loads no modules: without the capability in the
-            // bounding set the image's init knows it, as under a
+            // bounding set the process knows it, as under a
             // container manager, instead of failing to load any.
             if libc::prctl(libc::PR_CAPBSET_DROP, CAP_SYS_MODULE, 0, 0, 0) < 0 {
                 fail_child(report, Stage::Namespace);
@@ -329,7 +330,7 @@ fn namespace_parent(
 }
 
 /// Reads `fd` until the end of file (or an error other than an
-/// interruption): the wait of an init system's PID 1 for the first child
+/// interruption): the wait of the namespace's PID 1 for the first child
 /// to be reaped. Async-signal-safe, for a forked child.
 fn wait_for_end_of_file(fd: libc::c_int) {
     let mut byte = 0u8;
@@ -343,9 +344,9 @@ fn wait_for_end_of_file(fd: libc::c_int) {
 }
 
 /// The namespace's own mounts, from its PID 1 before `execve`, as
-/// container managers set them up for an init system: nothing propagates
+/// container managers set them up for a container: nothing propagates
 /// back, a `/proc` of the new PID namespace, `/sys` read-only (so the
-/// image's init manages no devices) but for a writable cgroup2 at
+/// process manages no devices) but for a writable cgroup2 at
 /// `/sys/fs/cgroup` that shows the cgroup namespace's root, and the
 /// output device as `/dev/console`.
 fn namespace_mounts(namespace: &Namespace) -> Result<(), ()> {

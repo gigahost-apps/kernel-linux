@@ -37,7 +37,21 @@ controllers() {
     done
 }
 r cgroup2_controllers controllers
-r cgroup2_child sh -c 'echo "+memory +pids +cpu +io" > /sys/fs/cgroup/cgroup.subtree_control && mkdir -p /sys/fs/cgroup/t && echo 64M > /sys/fs/cgroup/t/memory.max && cat /sys/fs/cgroup/t/memory.max && rmdir /sys/fs/cgroup/t'
+# The process's cgroup namespace root holds its processes, so, as in a
+# Docker container (docker-in-docker's entrypoint does the same), they
+# move into a child cgroup before the root's controllers are delegated.
+cgroup_child() {
+    mkdir -p /sys/fs/cgroup/init
+    while read -r pid; do
+        echo "${pid}" > /sys/fs/cgroup/init/cgroup.procs 2> /dev/null || true
+    done < /sys/fs/cgroup/cgroup.procs
+    echo "+memory +pids +cpu +io" > /sys/fs/cgroup/cgroup.subtree_control &&
+        mkdir -p /sys/fs/cgroup/t &&
+        echo 64M > /sys/fs/cgroup/t/memory.max &&
+        cat /sys/fs/cgroup/t/memory.max &&
+        rmdir /sys/fs/cgroup/t
+}
+r cgroup2_child cgroup_child
 r overlayfs sh -c 'mkdir -p /tmp/o/l /tmp/o/u /tmp/o/w /tmp/o/m && echo lower > /tmp/o/l/f && mount -t overlay overlay -o lowerdir=/tmp/o/l,upperdir=/tmp/o/u,workdir=/tmp/o/w /tmp/o/m && cat /tmp/o/m/f && echo up > /tmp/o/m/g && ls /tmp/o/u && umount /tmp/o/m'
 r dev_fuse sh -c 'test -c /dev/fuse && ls -l /dev/fuse'
 r wireguard sh -c 'ip link add wg0 type wireguard && ip -d link show wg0 | head -3 && ip link del wg0'
