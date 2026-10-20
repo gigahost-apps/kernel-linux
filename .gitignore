@@ -1,2 +1,4 @@
 /out/
-/target/
+# Cargo's build directory wherever cargo runs: the root, or init/ when
+# cargo runs there without CARGO_TARGET_DIR.
+target/
