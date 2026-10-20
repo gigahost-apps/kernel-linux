@@ -110,8 +110,9 @@ and command lines, where the output goes, the SSH keys (which replace a
 symbolic link rather than write through it), the process's signal state,
 the image's `/run` seen by a process of another user (owners and modes
 kept, writable, the disk's own unchanged) and version 5's volume paths,
-and that a kernel panic or a reboot by the process ends the machine; and
-version 3's init systems: two images built from `tests/init-systems/`
+that a kernel panic ends the machine, and that the process's
+`reboot -f` and `poweroff -f` end only its namespace, reported as signal
+1 and 2; and version 3's init systems: two images built from `tests/init-systems/`
 (Debian with systemd, Alpine with busybox init running OpenRC), unpacked
 by a version-3 unpack boot, each booted twice, whose checks
 (`init-features.sh`: the image's init is PID 1 of its namespace, systemd
@@ -125,8 +126,8 @@ the reports say. The cases print the boot time and the guest's
 `MemAvailable` at 256 MiB. It needs `podman`, QEMU, `/dev/kvm`,
 `mkfs.ext4`, `debugfs`, `python3`, `gzip` and `zstd`. Each case must end
 with QEMU exiting by itself within 30 s (an unpack within 120 s, an init
-system's boot within 60 s): the init's power-off, or for a panic or a
-reboot the reset, which `-no-reboot` turns into the end of QEMU.
+system's boot within 60 s): the init's power-off, or for a panic the
+reset, which `-no-reboot` turns into the end of QEMU.
 
 ## Where the kernel source comes from
 

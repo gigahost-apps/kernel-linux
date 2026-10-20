@@ -18,7 +18,9 @@ pub struct Spawn {
     pub groups: Vec<u32>,
     /// Start the program as PID 1 of PID, mount and cgroup namespaces of
     /// its own, as the init starts every mode's process (the run mode's
-    /// and `init_system`'s); `None` starts it as a plain child.
+    /// and `init_system`'s); `None` starts it as a plain child, which the
+    /// init's one caller never does; the branch stays for tests and
+    /// future callers.
     pub namespace: Option<Namespace>,
 }
 

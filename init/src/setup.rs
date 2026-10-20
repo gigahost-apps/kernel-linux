@@ -450,8 +450,8 @@ fn write_authorized_keys(keys: &config::AuthorizedKeys) -> Result<(), String> {
 }
 
 /// The payload cgroup the process's cgroup namespace starts at, with
-/// every controller the kernel offers enabled for it. The init stays in the root cgroup,
-/// which cgroup v2's no-internal-process rule exempts.
+/// every controller the kernel offers enabled for it. The init stays in
+/// the root cgroup, which cgroup v2's no-internal-process rule exempts.
 fn payload_cgroup() -> Result<(), String> {
     create_dir(PAYLOAD_CGROUP, 0o755)
         .map_err(|error| format!("creating the payload cgroup failed: {error}"))?;

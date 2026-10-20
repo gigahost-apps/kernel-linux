@@ -265,7 +265,7 @@ These are the run mode's steps; the unpack mode's follow.
      of its namespace it reaps the orphans of its namespace (an image
      whose process does not would gather zombies, as under Docker
      without `--init`), and the kernel delivers to it, from outside,
-     only the signals it has a handler for (and SIGKILL): a process that
+     only the signals it has a handler for (and SIGKILL and SIGSTOP): a process that
      does not handle its stop signal ends by the stop's SIGKILL after
      the timeout, as under `docker stop`;
    - every signal at its default action and none blocked;
