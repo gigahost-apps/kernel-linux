@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn a_symlinked_run_is_not_opened() {
+    fn open_at_refuses_a_symlink() {
         let scratch = Scratch::new();
         symlink("source", scratch.dir.join("run")).unwrap();
         let parent = stdfs::File::open(&scratch.dir).unwrap();

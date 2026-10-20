@@ -133,10 +133,9 @@ process; it is all of version 1 and the default of versions 2 to 5:
 Unknown fields are refused, at the top level and inside `authorized_keys`;
 a version-1 config has no `mode`, a version-1 or version-2 config no
 `init_system`, and a config before version 5 no `volumes` (each refused
-as an unknown field). No string may hold a NUL
-byte. A boot refuses a config of a later version than its own as one it
-does not support (as it did before that version existed), and one of an
-earlier version as not the boot's.
+as an unknown field). No string may hold a NUL byte. A boot refuses a config of a later version
+than its own as one it does not support (as it did before that version
+existed), and one of an earlier version as not the boot's.
 
 The **unpack mode** (versions 2 to 5) unpacks the image's layers onto the root
 disk and runs nothing:
@@ -281,7 +280,8 @@ What the init may create on the disk, when the image lacks it: the
 directories `/dev`, `/proc`, `/sys`, `/run` and `/etc`, empty
 `/etc/hosts`, `/etc/resolv.conf` and `/etc/hostname` files (as mount
 points), the working directory, `~/.ssh/authorized_keys` for
-`authorized_keys`, and the directories of version 5's `volumes`. Nothing else on the disk is written but by the process.
+`authorized_keys`, and the directories of version 5's `volumes`. Nothing
+else on the disk is written but by the process.
 
 Any failure in these steps (an unknown version, a bad config, no disk, a
 user or `argv[0]` not found, a failed mount) ends in an `error` report and
