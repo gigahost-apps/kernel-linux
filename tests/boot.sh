@@ -169,13 +169,19 @@ fail() {
     failures=$((failures + 1))
 }
 
-# qemu CMDLINE TIMEOUT DISK [LAYERS_DISK [MEMORY_MIB]]: boots the
+# qemu CMDLINE TIMEOUT DISK [LAYERS_DISK [MEMORY_MIB [OUTPUT]]]: boots the
 # machine of $case_dir with the config $case_dir/config.json; the serial
 # console lands in $case_dir/serial.log, hvc0 in $case_dir/hvc.log. QEMU
 # must exit by itself (the init's power-off) within TIMEOUT seconds.
+# OUTPUT defaults to hvc; serial omits hvc0 to exercise the fallback.
 qemu() {
     local cmdline=$1 timeout=$2 disk=$3 layers=${4:-} memory=${5:-256} rc=0
-    local layers_args=()
+    local layers_args=() output_args=()
+    if [[ ${6:-hvc} == hvc ]]; then
+        output_args=(-device "virtio-serial-pci,id=serial0"
+            -chardev "file,id=hvc,path=${case_dir}/hvc.log"
+            -device "virtconsole,chardev=hvc")
+    fi
     if [[ -n ${layers} ]]; then
         local drive="file=${layers},format=raw,if=none,id=layers,readonly=on"
         layers_args=(-drive "${drive}" -device "virtio-blk-pci,drive=layers")
@@ -185,9 +191,7 @@ qemu() {
         -display none -no-reboot \
         -kernel "${kernel}" -initrd "${initrd}" -append "${cmdline}" \
         -serial "file:${case_dir}/serial.log" \
-        -device virtio-serial-pci,id=serial0 \
-        -chardev "file,id=hvc,path=${case_dir}/hvc.log" \
-        -device virtconsole,chardev=hvc \
+        "${output_args[@]}" \
         -drive "file=${disk},format=raw,if=none,id=disk" \
         -device virtio-blk-pci,drive=disk \
         "${layers_args[@]}" \
@@ -212,12 +216,12 @@ new_case() {
     echo "boot.sh: case $1"
 }
 
-# boot NAME CONFIG_JSON [CMDLINE]: boots a fresh copy of the unpacked disk
+# boot NAME CONFIG_JSON [CMDLINE [OUTPUT]]: boots a fresh copy of the unpacked disk
 # with the config.
 boot() {
     new_case "$1" "$2"
     cp --sparse=always "${work}/disk.img" "${case_dir}/disk.img"
-    qemu "${3:-${default_cmdline}}" "${case_timeout}" "${case_dir}/disk.img"
+    qemu "${3:-${default_cmdline}}" "${case_timeout}" "${case_dir}/disk.img" "" 256 "${4:-hvc}"
 }
 
 # unpack_boot NAME CONFIG_FILE LAYERS_DISK [DISK_MIB [MEMORY_MIB [ROOT_DISK]]]:
@@ -599,6 +603,84 @@ grep -a -q '^gigahost-init: start [0-9]*' "${case_dir}/serial.log" || fail "no s
 expect_absent hvc.log gigahost-init
 expect_report '"code":0,"signal":null,"reason":"exited"'
 show_logs "${before}"
+
+# Reopen all output aliases as root, as a configured user, and after a
+# privilege drop. Every redirection must succeed before the next command.
+output_probe_config() {
+    python3 - "$1" "$2" << 'PYTHON'
+import json, shlex, sys
+identity, output = sys.argv[1:]
+uid = 0 if identity == "root" else 65534
+script = f"""set -eu
+[ "$(id -u)" = {uid} ]
+echo probe-inherited-stdout
+echo probe-inherited-stderr >&2
+for path in /dev/stdout /dev/stderr /proc/self/fd/1 /proc/self/fd/2 /dev/console; do
+    echo "probe-write-$path" > "$path"
+    echo "probe-append-$path" >> "$path"
+done
+"""
+if output == "hvc":
+    script += '[ "$(stat -c %a:%u:%g /dev/hvc0)" = 622:0:0 ]\n'
+    script += '[ "$(stat -c %a:%u:%g /dev/ttyS0)" = 600:0:0 ]\n'
+    device = "/dev/hvc0"
+else:
+    script += '[ ! -e /dev/hvc0 ]\n'
+    script += '[ "$(stat -c %a:%u:%g /dev/console)" = 622:0:0 ]\n'
+    device = "/dev/console"
+if uid != 0:
+    script += f'[ -w {device} ]\n[ ! -r {device} ]\n'
+    if output == "hvc":
+        script += '[ ! -w /dev/ttyS0 ]\n[ ! -r /dev/ttyS0 ]\n'
+script += 'echo probe-complete\n'
+if identity == "drop":
+    script = "exec /bin/busybox su -s /bin/sh nobody -c " + shlex.quote(script)
+config = {"version": 1, "argv": ["/bin/sh", "-c", script]}
+if identity == "user":
+    config["user"] = "nobody"
+print(json.dumps(config))
+PYTHON
+}
+
+expect_output_probe() {
+    local output=$1 destination=hvc.log other=serial.log path
+    if [[ ${output} == serial ]]; then
+        destination=serial.log
+        other=hvc.log
+    fi
+    for path in inherited-stdout inherited-stderr \
+        write-/dev/stdout append-/dev/stdout write-/dev/stderr append-/dev/stderr \
+        write-/proc/self/fd/1 append-/proc/self/fd/1 \
+        write-/proc/self/fd/2 append-/proc/self/fd/2 \
+        write-/dev/console append-/dev/console complete; do
+        # The serial tty's cooked mode adds CR; normalize only that log.
+        if [[ ${output} == serial ]]; then
+            tr -d '\r' < "${case_dir}/serial.log" > "${case_dir}/serial-normalized.log"
+            expect_line serial-normalized.log "probe-${path}"
+        else
+            expect_line "${destination}" "probe-${path}"
+        fi
+        expect_absent "${other}" "probe-${path}"
+    done
+    expect_report '"code":0,"signal":null,"reason":"exited"'
+}
+
+for output in hvc serial; do
+    for identity in root user drop; do
+        before=${failures}
+        boot "output-${output}-${identity}" "$(output_probe_config "${identity}" "${output}")" "${default_cmdline}" "${output}"
+        expect_output_probe "${output}"
+        show_logs "${before}"
+        if [[ ${identity} == user ]]; then
+            # Reuse the disk, but start a fresh VM: devtmpfs permissions must
+            # be set again rather than relying on the previous boot's state.
+            before=${failures}
+            qemu "${default_cmdline}" "${case_timeout}" "${case_dir}/disk.img" "" 256 "${output}"
+            expect_output_probe "${output}"
+            show_logs "${before}"
+        fi
+    done
+done
 
 # 7. The SSH keys replace root's authorized_keys, a symbolic link to
 # /etc/shadow, instead of writing through it.

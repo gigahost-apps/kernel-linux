@@ -270,7 +270,12 @@ These are the run mode's steps; the unpack mode's follow.
      the timeout, as under `docker stop`;
    - every signal at its default action and none blocked;
    - stdin is `/dev/null`; stdout and stderr go to `/dev/hvc0` in raw mode
-     (byte for byte, no `\r` added), or to the serial console without hvc0;
+     (byte for byte, no `\r` added), or to the serial console without hvc0.
+     Since release 6.18.57-gh7, the selected output device is root-owned
+     with mode 0622 on every boot: all users can reopen `/dev/stdout`,
+     `/dev/stderr` and `/proc/self/fd/{1,2}` for writing, including after
+     dropping privileges. This grants no read access to non-root users
+     and changes no other console device;
    - a new session, no controlling terminal;
    - the environment: `PATH`
      (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`)

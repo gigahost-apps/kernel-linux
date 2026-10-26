@@ -529,6 +529,9 @@ fn start(config: &Config, args: &KernelArgs) -> Result<i32, String> {
     } else {
         "/dev/console"
     };
+    // Apps may reopen their streams after dropping privileges to any UID.
+    fs::set_permissions(output, fs::Permissions::from_mode(0o622))
+        .map_err(|error| format!("setting output device {output} permissions failed: {error}"))?;
     let mut spawn = process::Spawn::new(
         &program,
         &config.argv,
